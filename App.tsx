@@ -15,7 +15,8 @@ import {
   User,
   Bot,
   X,
-  Sparkles
+  Sparkles,
+  AlertCircle
 } from 'lucide-react';
 import { AppState, ParsedDocument, Chapter, Message } from './types';
 import { extractPerfectStructure, downloadJson } from './services/docxParser';
@@ -47,6 +48,11 @@ const App: React.FC = () => {
     const file = event.target.files?.[0];
     if (!file) return;
 
+    if (file.name.toLowerCase().endsWith('.doc')) {
+      alert('抱歉，本工具仅支持现代 .docx 格式。请将您的 .doc 文件在 Word 中另存为 .docx 后再试。');
+      return;
+    }
+
     try {
       setState(AppState.PARSING);
       const parsed = await extractPerfectStructure(file);
@@ -55,7 +61,6 @@ const App: React.FC = () => {
         setActiveChapterId(parsed.chapters[0].id);
       }
       setState(AppState.VIEWING);
-      // Reset chat when new file uploaded
       setMessages([]);
     } catch (error) {
       console.error('Parsing failed:', error);
@@ -90,7 +95,6 @@ const App: React.FC = () => {
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
-      // Prepare context from active chapter or whole doc
       const context = activeChapter 
         ? `当前正在阅读的章节内容: ${activeChapter.title}\n\n${activeChapter.content.replace(/<[^>]*>?/gm, '')}`
         : `文档整体内容预览: ${doc.chapters.slice(0, 3).map(c => c.title).join(', ')}`;
@@ -215,16 +219,19 @@ const App: React.FC = () => {
               </>
             )}
             {state !== AppState.VIEWING && (
-              <label className="cursor-pointer bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 shadow-lg shadow-blue-200">
-                <FileUp size={18} />
-                上传招标文件 (.docx)
-                <input 
-                  type="file" 
-                  accept=".docx" 
-                  className="hidden" 
-                  onChange={handleFileUpload} 
-                />
-              </label>
+              <div className="flex flex-col items-end">
+                <label className="cursor-pointer bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 shadow-lg shadow-blue-200">
+                  <FileUp size={18} />
+                  上传招标文件 (.docx)
+                  <input 
+                    type="file" 
+                    accept=".docx" 
+                    className="hidden" 
+                    onChange={handleFileUpload} 
+                  />
+                </label>
+                <span className="text-[10px] text-slate-400 mt-1 mr-1">※ 不支持旧版 .doc 格式</span>
+              </div>
             )}
           </div>
         </header>
@@ -237,24 +244,30 @@ const App: React.FC = () => {
                 <FileUp size={40} />
               </div>
               <h2 className="text-3xl font-bold text-slate-800 mb-4">开始结构化解析</h2>
-              <p className="text-slate-500 mb-8 leading-relaxed text-lg">
-                上传您的招标文件 (.docx)，系统将自动过滤目录干扰、智能提取章节结构、还原复杂表格，并高亮标注填空项。
+              <p className="text-slate-500 mb-6 leading-relaxed text-lg">
+                上传您的现代 Word 文档 (<b>.docx</b>)，系统将自动过滤目录干扰、智能提取章节结构、还原复杂表格，并高亮标注填空项。
               </p>
+              
+              <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 border border-amber-100 rounded-xl text-amber-800 text-sm mb-10">
+                <AlertCircle size={18} className="shrink-0" />
+                <span><b>注意：</b> 不支持 2003 版及更早的 .doc 二进制格式。请先在 Word 中将其“另存为” .docx 文件。</span>
+              </div>
+
               <div className="grid grid-cols-2 gap-4 w-full text-left">
                 <FeatureCard 
                   icon={<Menu className="text-blue-500" />}
-                  title="智能章节提取"
-                  desc="自动识别符合 'Chapter' 或 '第X章' 规范的标题。"
+                  title="多级标题识别"
+                  desc="自动识别符合 '第一篇'、'第1章' 或 '第一部分' 规范的标题。"
                 />
                 <FeatureCard 
                   icon={<Loader2 className="text-emerald-500" />}
-                  title="去噪处理"
-                  desc="过滤页码、目录点线及页眉页脚等干扰内容。"
+                  title="智能去噪"
+                  desc="自动识别并移除目录页页码及引导线干扰。"
                 />
                 <FeatureCard 
                   icon={<Info className="text-yellow-500" />}
                   title="填空项标注"
-                  desc="自动识别 [ ] 或 ____ 并在文档中醒目高亮。"
+                  desc="自动识别 [ ]、____ 或 ( ) 并在文档中醒目高亮。"
                 />
                 <FeatureCard 
                   icon={<FileJson className="text-purple-500" />}
@@ -292,15 +305,17 @@ const App: React.FC = () => {
           {state === AppState.ERROR && (
             <div className="h-full flex flex-col items-center justify-center">
               <div className="w-16 h-16 bg-red-50 text-red-500 rounded-full flex items-center justify-center mb-4">
-                <Info size={32} />
+                <AlertCircle size={32} />
               </div>
               <h3 className="text-xl font-bold text-slate-800">解析失败</h3>
-              <p className="text-slate-500 mt-2">无法读取该文件，请确保它是有效的 .docx 文档。</p>
+              <p className="text-slate-500 mt-2 max-w-sm text-center">
+                无法读取该文件。请确保它不是损坏的文件，且<b>不是旧版 .doc 格式</b>。
+              </p>
               <button 
                 onClick={() => setState(AppState.IDLE)}
                 className="mt-6 px-6 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-900 transition-colors"
               >
-                重试
+                返回重试
               </button>
             </div>
           )}
