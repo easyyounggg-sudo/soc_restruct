@@ -23,3 +23,9 @@ export interface Message {
   text: string;
   timestamp: number;
 }
+
+export interface ApiKeyConfig {
+  provider: 'gemini';
+  apiKey: string;
+  savedAt: number;
+}

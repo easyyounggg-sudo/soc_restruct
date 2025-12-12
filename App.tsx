@@ -16,11 +16,42 @@ import {
   Bot,
   X,
   Sparkles,
-  AlertCircle
+  AlertCircle,
+  Settings,
+  Key
 } from 'lucide-react';
 import { AppState, ParsedDocument, Chapter, Message } from './types';
 import { extractPerfectStructure, downloadJson } from './services/docxParser';
 import { GoogleGenAI } from "@google/genai";
+import { ApiKeyModal, getStoredApiKey } from './components/ApiKeyModal';
+
+// 简单的 Markdown 解析函数
+const parseMarkdown = (text: string): string => {
+  return text
+    // 代码块
+    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="bg-slate-800 text-slate-100 p-3 rounded-lg overflow-x-auto my-2 text-xs"><code>$2</code></pre>')
+    // 行内代码
+    .replace(/`([^`]+)`/g, '<code class="bg-slate-200 text-slate-800 px-1.5 py-0.5 rounded text-xs">$1</code>')
+    // 加粗
+    .replace(/\*\*([^*]+)\*\*/g, '<strong class="font-semibold">$1</strong>')
+    // 斜体
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    // 标题 (h1-h3)
+    .replace(/^### (.+)$/gm, '<h3 class="font-bold text-sm mt-3 mb-1">$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2 class="font-bold text-base mt-3 mb-1">$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1 class="font-bold text-lg mt-3 mb-2">$1</h1>')
+    // 无序列表
+    .replace(/^\* (.+)$/gm, '<li class="ml-4 list-disc">$1</li>')
+    .replace(/^- (.+)$/gm, '<li class="ml-4 list-disc">$1</li>')
+    // 有序列表
+    .replace(/^\d+\. (.+)$/gm, '<li class="ml-4 list-decimal">$1</li>')
+    // 包裹连续的 li 元素
+    .replace(/(<li[^>]*>.*<\/li>\n?)+/g, '<ul class="my-2 space-y-1">$&</ul>')
+    // 分隔线
+    .replace(/^---$/gm, '<hr class="my-3 border-slate-200">')
+    // 换行
+    .replace(/\n/g, '<br>');
+};
 
 const App: React.FC = () => {
   const [state, setState] = useState<AppState>(AppState.IDLE);
@@ -35,6 +66,26 @@ const App: React.FC = () => {
   const [inputText, setInputText] = useState('');
   const [isAiLoading, setIsAiLoading] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // API Key State
+  const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
+  const [userApiKey, setUserApiKey] = useState<string | null>(null);
+
+
+  // Load API Key from localStorage on mount
+  useEffect(() => {
+    const storedKey = getStoredApiKey();
+    if (storedKey) {
+      setUserApiKey(storedKey);
+    }
+  }, []);
+
+  // Get the active API key (user's key takes priority)
+  const getActiveApiKey = (): string | null => {
+    return userApiKey || process.env.API_KEY || null;
+  };
+
+  const hasApiKey = !!getActiveApiKey();
 
   const scrollToBottom = () => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -82,6 +133,16 @@ const App: React.FC = () => {
   const handleSendMessage = async () => {
     if (!inputText.trim() || !doc || isAiLoading) return;
 
+    const activeKey = getActiveApiKey();
+    if (!activeKey) {
+      setMessages(prev => [...prev, {
+        role: 'model',
+        text: "请先配置 API Key 后再使用 AI 助手功能。点击右上角的设置按钮进行配置。",
+        timestamp: Date.now()
+      }]);
+      return;
+    }
+
     const userMessage: Message = {
       role: 'user',
       text: inputText,
@@ -93,14 +154,17 @@ const App: React.FC = () => {
     setIsAiLoading(true);
 
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: activeKey });
       
-      const context = activeChapter 
-        ? `当前正在阅读的章节内容: ${activeChapter.title}\n\n${activeChapter.content.replace(/<[^>]*>?/gm, '')}`
-        : `文档整体内容预览: ${doc.chapters.slice(0, 3).map(c => c.title).join(', ')}`;
+      // 构建全文档上下文
+      const fullContent = doc.chapters.map((chapter, index) => {
+        const cleanContent = chapter.content.replace(/<[^>]*>?/gm, '').trim();
+        return `【章节 ${index + 1}: ${chapter.title}】\n${cleanContent}`;
+      }).join('\n\n---\n\n');
+      const context = `完整招标文件内容（共 ${doc.chapters.length} 个章节）:\n\n${fullContent}`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-2.5-flash-lite',
         contents: `基于以下招标文件内容回答我的问题：\n\n【文档上下文】\n${context}\n\n【用户问题】\n${inputText}`,
         config: {
           systemInstruction: "你是一个专业的招标文件分析助手。请根据提供的招标文件内容回答用户的问题。回答要准确、客观、专业。如果文档中没有相关信息，请如实告知。请始终使用中文回答。",
@@ -113,11 +177,16 @@ const App: React.FC = () => {
         timestamp: Date.now()
       };
       setMessages(prev => [...prev, aiResponse]);
-    } catch (error) {
+    } catch (error: any) {
       console.error('AI Error:', error);
+      
+      // 直接显示原始错误信息，便于调试
+      const rawMessage = error?.message || String(error);
+      console.error('Full error details:', JSON.stringify(error, null, 2));
+      
       setMessages(prev => [...prev, {
         role: 'model',
-        text: "抱歉，由于网络或 API 限制，暂时无法回应。请检查 API Key 配置。",
+        text: `❌ AI 请求失败:\n\n${rawMessage}`,
         timestamp: Date.now()
       }]);
     } finally {
@@ -127,6 +196,13 @@ const App: React.FC = () => {
 
   return (
     <div className="flex h-screen bg-slate-50 text-slate-900 overflow-hidden relative">
+      {/* API Key Modal */}
+      <ApiKeyModal
+        isOpen={isApiKeyModalOpen}
+        onClose={() => setIsApiKeyModalOpen(false)}
+        onSave={(key) => setUserApiKey(key || null)}
+        currentApiKey={userApiKey}
+      />
       {/* Sidebar */}
       {state === AppState.VIEWING && isSidebarOpen && (
         <aside className="w-80 border-r border-slate-200 bg-white flex flex-col shadow-sm z-20">
@@ -199,6 +275,20 @@ const App: React.FC = () => {
             </h1>
           </div>
           <div className="flex items-center gap-3">
+            {/* API Key 设置按钮 - 始终显示 */}
+            <button
+              onClick={() => setIsApiKeyModalOpen(true)}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-all shadow-sm ${
+                hasApiKey
+                  ? 'bg-green-50 text-green-700 border border-green-200 hover:bg-green-100'
+                  : 'bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 animate-pulse'
+              }`}
+              title={hasApiKey ? 'API Key 已配置' : '请配置 API Key'}
+            >
+              <Key size={14} />
+              <span className="hidden sm:inline">{hasApiKey ? 'API Key 已配置' : '设置 API Key'}</span>
+            </button>
+
             {state === AppState.VIEWING && (
               <>
                 <div className="hidden md:flex items-center gap-2 px-3 py-1 bg-yellow-50 text-yellow-700 border border-yellow-100 rounded-full text-xs font-medium">
@@ -344,11 +434,11 @@ const App: React.FC = () => {
             {messages.length === 0 && (
               <div className="h-full flex flex-col items-center justify-center text-center px-6">
                 <Bot size={48} className="text-blue-200 mb-4" />
-                <p className="text-slate-500 text-sm">
-                  我是您的招标文件助手。您可以询问关于本章节的任何问题，例如：
+                <p className="text-slate-500 text-sm mb-4">
+                  我已阅读完整文档，可以回答关于整份招标文件的任何问题：
                 </p>
-                <div className="mt-4 space-y-2 w-full">
-                  {["这部分的报价要求是什么？", "有哪些关键的时间节点？", "合同签署需要哪些材料？"].map((q, i) => (
+                <div className="space-y-2 w-full">
+                  {["请总结这份招标文件的主要内容", "投标的资质要求有哪些？", "有哪些关键的时间节点？", "合同签署需要哪些材料？"].map((q, i) => (
                     <button 
                       key={i}
                       onClick={() => setInputText(q)}
@@ -367,13 +457,16 @@ const App: React.FC = () => {
                 }`}>
                   {msg.role === 'user' ? <User size={16} /> : <Bot size={16} />}
                 </div>
-                <div className={`max-w-[80%] p-3 rounded-2xl text-sm shadow-sm ${
-                  msg.role === 'user' 
-                    ? 'bg-blue-600 text-white rounded-tr-none' 
-                    : 'bg-white text-slate-800 border border-slate-100 rounded-tl-none'
-                }`}>
-                  {msg.text}
-                </div>
+                {msg.role === 'user' ? (
+                  <div className="max-w-[80%] p-3 rounded-2xl rounded-tr-none text-sm shadow-sm bg-blue-600 text-white">
+                    {msg.text}
+                  </div>
+                ) : (
+                  <div 
+                    className="max-w-[85%] p-4 rounded-2xl rounded-tl-none text-sm shadow-sm bg-white text-slate-800 border border-slate-100 prose prose-sm prose-slate"
+                    dangerouslySetInnerHTML={{ __html: parseMarkdown(msg.text) }}
+                  />
+                )}
               </div>
             ))}
             {isAiLoading && (
