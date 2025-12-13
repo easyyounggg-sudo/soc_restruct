@@ -33,13 +33,22 @@
             border-radius: 2px;
         }
         
+        /* PDF 表格容器 - 防止溢出 */
+        .table-wrapper {
+            width: 100%;
+            overflow-x: auto;
+            margin: 1.5rem 0;
+            -webkit-overflow-scrolling: touch;
+        }
+        
         /* PDF 表格样式 */
         .pdf-table {
-            width: 100%;
+            width: max-content;
+            min-width: 100%;
             border-collapse: collapse;
-            margin: 1.5rem 0;
             font-size: 0.9rem;
             background: white;
+            table-layout: fixed;
         }
         .pdf-table td, .pdf-table th {
             border: 1px solid #d1d5db;
@@ -47,13 +56,21 @@
             text-align: left;
             vertical-align: top;
             line-height: 1.6;
+            min-width: 80px;
+            max-width: 400px;
+            word-wrap: break-word;
+            white-space: pre-wrap;
         }
         .pdf-table th {
             background-color: #f3f4f6;
             font-weight: 600;
+            white-space: nowrap;
         }
         .pdf-table tr:nth-child(even) {
             background-color: #f9fafb;
+        }
+        .pdf-table tr:hover {
+            background-color: #f0f4ff;
         }
         
         /* PDF 段落样式 */
@@ -76,10 +93,34 @@
             border-radius: 8px;
             border: 1px solid #e5e7eb;
             overflow-x: auto;
+            max-width: 100%;
+        }
+        .extracted-table .table-wrapper {
+            margin: 0;
         }
         .extracted-table .pdf-table {
             margin: 0;
             background: white;
+        }
+        
+        /* 滚动条样式 */
+        .table-wrapper::-webkit-scrollbar,
+        .extracted-table::-webkit-scrollbar {
+            height: 8px;
+        }
+        .table-wrapper::-webkit-scrollbar-track,
+        .extracted-table::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 4px;
+        }
+        .table-wrapper::-webkit-scrollbar-thumb,
+        .extracted-table::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 4px;
+        }
+        .table-wrapper::-webkit-scrollbar-thumb:hover,
+        .extracted-table::-webkit-scrollbar-thumb:hover {
+            background: #a1a1a1;
         }
         
         /* 章节内容区域样式优化 */
