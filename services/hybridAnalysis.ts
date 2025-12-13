@@ -13,9 +13,9 @@ import {
 
 // 高风险关键词（用于 Regex 撒网）
 const RISK_KEYWORDS = [
-  '废标', '无效', '拒绝', '必须', '★', '▲', '☆', '△',
+  '废标', '无效', '拒绝', '★', '▲', '☆', '△',
   '资格', '实质性', '否决', '不得', '不允许', '禁止',
-  '强制', '应当', '须', '不予受理', '取消资格', '失效'
+  '不予受理', '取消资格', '失效'
 ];
 
 // 章节标题关键词映射
@@ -24,7 +24,7 @@ const CHAPTER_KEYWORDS = {
   instructions: ['投标人须知', '须知', '投标须知', '说明'],
   scoring: ['评分', '评审', '打分', '评标'],
   technical: ['采购需求', '技术要求', '技术需求', '技术规格', '技术参数', '设备配置', '货物需求', '项目需求', '服务需求'],
-  format: ['投标文件格式', '响应文件格式', '文件组成', '投标文件的组成', '响应文件组成', '投标文件编制'],
+  format: ['投标文件格式', '投标文件的格式', '响应文件格式', '响应文件的格式', '文件组成', '投标文件的组成', '响应文件组成', '投标文件编制', '文件格式'],
   qualification: ['资格', '资质', '条件']
 };
 
@@ -176,6 +176,29 @@ interface HtmlSlices {
 }
 
 function extractHtmlSlices(doc: ParsedDocument): HtmlSlices {
+  // 智能关键词匹配：支持分词匹配（如 "格式" 匹配 "投标文件的格式"）
+  const smartMatch = (title: string, keywords: string[]): boolean => {
+    const normalizedTitle = title.replace(/\s+/g, '');
+    
+    for (const kw of keywords) {
+      // 完整匹配
+      if (normalizedTitle.includes(kw)) {
+        return true;
+      }
+      
+      // 分词匹配：关键词的每个核心词都在标题中
+      // 例如 "投标文件格式" -> ["投标", "文件", "格式"]
+      const coreWords = kw.match(/[\u4e00-\u9fa5]{2,}/g) || [];
+      if (coreWords.length >= 2) {
+        const allMatch = coreWords.every(word => normalizedTitle.includes(word));
+        if (allMatch) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
   // 带排除逻辑的章节查找
   const findChapterHtml = (
     keywords: string[], 
@@ -186,11 +209,9 @@ function extractHtmlSlices(doc: ParsedDocument): HtmlSlices {
       const shouldExclude = excludeKeywords.some(ek => chapter.title.includes(ek));
       if (shouldExclude) continue;
       
-      // 检查是否匹配目标关键词
-      for (const kw of keywords) {
-        if (chapter.title.includes(kw)) {
-          return chapter.content;
-        }
+      // 使用智能匹配
+      if (smartMatch(chapter.title, keywords)) {
+        return chapter.content;
       }
     }
     return null;
@@ -218,19 +239,36 @@ function extractHtmlSlices(doc: ParsedDocument): HtmlSlices {
   };
 }
 
-// 根据章节标题查找章节内容
+// 根据章节标题查找章节内容（智能匹配）
 function findChapterByTitle(doc: ParsedDocument, title: string | null | undefined): string | null {
   if (!title) return null;
   
-  // 精确匹配
+  const normalizedTarget = title.replace(/\s+/g, '').replace(/第[一二三四五六七八九十\d]+[章节篇部]\s*/, '');
+  
+  // 1. 精确匹配
   const exactMatch = doc.chapters.find(c => c.title === title);
   if (exactMatch) return exactMatch.content;
   
-  // 模糊匹配（包含关系）
-  const fuzzyMatch = doc.chapters.find(c => 
-    c.title.includes(title) || title.includes(c.title)
-  );
-  if (fuzzyMatch) return fuzzyMatch.content;
+  // 2. 去除章节号后匹配
+  const noNumMatch = doc.chapters.find(c => {
+    const normalizedChapter = c.title.replace(/\s+/g, '').replace(/第[一二三四五六七八九十\d]+[章节篇部]\s*/, '');
+    return normalizedChapter === normalizedTarget || 
+           normalizedChapter.includes(normalizedTarget) || 
+           normalizedTarget.includes(normalizedChapter);
+  });
+  if (noNumMatch) return noNumMatch.content;
+  
+  // 3. 核心词匹配（提取2字以上的中文词）
+  const targetWords = normalizedTarget.match(/[\u4e00-\u9fa5]{2,}/g) || [];
+  if (targetWords.length >= 1) {
+    const wordMatch = doc.chapters.find(c => {
+      const chapterNormalized = c.title.replace(/\s+/g, '');
+      // 至少匹配50%的核心词
+      const matchCount = targetWords.filter(w => chapterNormalized.includes(w)).length;
+      return matchCount >= Math.ceil(targetWords.length * 0.5);
+    });
+    if (wordMatch) return wordMatch.content;
+  }
   
   return null;
 }
@@ -260,8 +298,11 @@ interface AIAnalysisResult {
 async function performAIAnalysis(
   doc: ParsedDocument,
   rawRiskCandidates: RawRiskCandidate[],
-  apiKey: string
+  apiKey: string,
+  retryCount: number = 0
 ): Promise<AIAnalysisResult | null> {
+  const MAX_RETRIES = 3;
+  
   try {
     const ai = new GoogleGenAI({ apiKey });
     
@@ -273,16 +314,33 @@ async function performAIAnalysis(
       CHAPTER_KEYWORDS.instructions.some(kw => c.title.includes(kw))
     );
     
+    // 限制内容大小，避免请求过大
+    const maxContentLength = 6000;  // 减少到 6000 字符
     const noticeText = noticeChapter 
-      ? noticeChapter.content.replace(/<[^>]*>/g, '').substring(0, 8000)
+      ? noticeChapter.content.replace(/<[^>]*>/g, '').substring(0, maxContentLength)
       : '';
     const instructionsText = instructionsChapter 
-      ? instructionsChapter.content.replace(/<[^>]*>/g, '').substring(0, 8000)
+      ? instructionsChapter.content.replace(/<[^>]*>/g, '').substring(0, maxContentLength)
       : '';
     
-    // 构建风险候选项列表（限制数量避免超出 token）
-    const riskList = rawRiskCandidates.slice(0, 50).map((r, i) => 
-      `[${i + 1}] 章节「${r.chapterTitle}」: ${r.text.substring(0, 200)}`
+    // 构建风险候选项列表（优先 ★/▲ 相关的条款）
+    const maxRisks = 50;  // 增加到 50 条
+    const maxTextLen = 180;  // 每条最多 180 字符
+    
+    // 分离 ★/▲ 相关和其他风险
+    const starRisks = rawRiskCandidates.filter(r => 
+      r.text.includes('★') || r.text.includes('▲') || r.text.includes('☆') || r.text.includes('△')
+    );
+    const otherRisks = rawRiskCandidates.filter(r => 
+      !r.text.includes('★') && !r.text.includes('▲') && !r.text.includes('☆') && !r.text.includes('△')
+    );
+    
+    // 优先使用 ★/▲ 相关的，再补充其他的
+    const prioritizedRisks = [...starRisks, ...otherRisks].slice(0, maxRisks);
+    console.log(`   ★/▲ 相关候选项: ${starRisks.length} 条`);
+    
+    const riskList = prioritizedRisks.map((r, i) => 
+      `[${i + 1}] 章节「${r.chapterTitle}」: ${r.text.substring(0, maxTextLen)}`
     ).join('\n');
     
     const systemPrompt = `# Role: 资深标书合规审计师 (Senior Bid Compliance Auditor)
@@ -372,6 +430,12 @@ ${riskList || '（未发现风险候选条款）'}
 
 请严格按照 JSON 格式返回分析结果，包括 chapterMapping 字段。`;
 
+    // 计算请求大小
+    const requestSize = systemPrompt.length + userPrompt.length;
+    console.log('   请求内容大小:', Math.round(requestSize / 1024), 'KB');
+    console.log('   风险候选项数量:', rawRiskCandidates.length);
+    console.log('   章节数量:', doc.chapters.length);
+    
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash-lite',
       contents: userPrompt,
@@ -381,17 +445,41 @@ ${riskList || '（未发现风险候选条款）'}
     });
     
     const responseText = response.text || '';
+    console.log('   AI 原始响应长度:', responseText.length);
     
     // 尝试提取 JSON
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
-      return parsed as AIAnalysisResult;
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        console.log('   AI JSON 解析成功');
+        return parsed as AIAnalysisResult;
+      } catch (parseError) {
+        console.error('   AI JSON 解析失败:', parseError);
+        console.log('   AI 返回内容预览:', responseText.substring(0, 500));
+        return null;
+      }
     }
     
+    console.log('   AI 响应中未找到 JSON，内容预览:', responseText.substring(0, 500));
     return null;
-  } catch (error) {
-    console.error('AI Analysis Error:', error);
+  } catch (error: any) {
+    const errorMsg = error?.message || String(error);
+    console.error('AI Analysis Error:', errorMsg);
+    
+    // 检查是否是网络错误，可以重试
+    const isNetworkError = errorMsg.includes('fetch') || 
+                           errorMsg.includes('network') || 
+                           errorMsg.includes('CONNECTION');
+    
+    if (isNetworkError && retryCount < MAX_RETRIES) {
+      const delay = (retryCount + 1) * 2000;  // 2s, 4s, 6s
+      console.log(`   网络错误，${delay/1000}秒后重试 (${retryCount + 1}/${MAX_RETRIES})...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return performAIAnalysis(doc, rawRiskCandidates, apiKey, retryCount + 1);
+    }
+    
+    console.error('   AI 分析最终失败');
     return null;
   }
 }
@@ -517,25 +605,43 @@ function synthesizeResults(
 
 export async function analyzeBidDocument(
   doc: ParsedDocument,
-  apiKey: string
+  apiKey: string,
+  signal?: AbortSignal
 ): Promise<KeyInformation> {
+  // 检查取消信号
+  const checkAborted = () => {
+    if (signal?.aborted) {
+      throw new DOMException('Analysis cancelled', 'AbortError');
+    }
+  };
+
   console.log('🔍 Step A: Regex 撒网 - 提取风险候选项...');
+  checkAborted();
   const rawRiskCandidates = extractRiskCandidates(doc);
   console.log(`   找到 ${rawRiskCandidates.length} 个风险候选项`);
   
   console.log('📋 Step B: Regex 扫描 - 提取基本信息...');
+  checkAborted();
   const regexInfo = extractBasicInfoByRegex(doc.rawHtml);
   console.log('   基本信息提取完成');
   
   console.log('✂️ Step C: HTML 切片 - 提取关键章节...');
+  checkAborted();
   const htmlSlices = extractHtmlSlices(doc);
-  console.log('   HTML 切片完成');
+  console.log('   匹配结果:', {
+    评分标准: htmlSlices.matchStatus.scoring ? '✅ 已匹配' : '❌ 未匹配',
+    技术要求: htmlSlices.matchStatus.technical ? '✅ 已匹配' : '❌ 未匹配',
+    格式要求: htmlSlices.matchStatus.format ? '✅ 已匹配' : '❌ 未匹配'
+  });
+  console.log('   章节列表:', doc.chapters.map(c => c.title));
   
   console.log('🤖 Step D: AI 审计分析...');
+  checkAborted();
   const aiResult = await performAIAnalysis(doc, rawRiskCandidates, apiKey);
   console.log(aiResult ? '   AI 分析成功' : '   AI 分析失败，使用回退方案');
   
   console.log('🔗 Step E: 合成与冲突解决...');
+  checkAborted();
   const result = synthesizeResults(doc, regexInfo, aiResult, rawRiskCandidates, htmlSlices);
   console.log('   分析完成！');
   

@@ -32,6 +32,76 @@
             padding: 0 2px;
             border-radius: 2px;
         }
+        
+        /* PDF 表格样式 */
+        .pdf-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.5rem 0;
+            font-size: 0.9rem;
+            background: white;
+        }
+        .pdf-table td, .pdf-table th {
+            border: 1px solid #d1d5db;
+            padding: 0.75rem 1rem;
+            text-align: left;
+            vertical-align: top;
+            line-height: 1.6;
+        }
+        .pdf-table th {
+            background-color: #f3f4f6;
+            font-weight: 600;
+        }
+        .pdf-table tr:nth-child(even) {
+            background-color: #f9fafb;
+        }
+        
+        /* PDF 段落样式 */
+        .pdf-para {
+            margin: 0.75rem 0;
+            line-height: 1.8;
+            text-align: justify;
+        }
+        
+        /* PDF 块级元素 */
+        .pdf-block {
+            margin: 0.5rem 0;
+        }
+        
+        /* 提取的表格容器 */
+        .extracted-table {
+            margin: 1.5rem 0;
+            padding: 1rem;
+            background: #fafbfc;
+            border-radius: 8px;
+            border: 1px solid #e5e7eb;
+            overflow-x: auto;
+        }
+        .extracted-table .pdf-table {
+            margin: 0;
+            background: white;
+        }
+        
+        /* 章节内容区域样式优化 */
+        .chapter-content p {
+            margin: 0.75rem 0;
+            line-height: 1.8;
+        }
+        .chapter-content table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.5rem 0;
+        }
+        .chapter-content td, .chapter-content th {
+            border: 1px solid #e5e7eb;
+            padding: 0.75rem;
+            line-height: 1.6;
+        }
+        
+        /* 通用文本间距 */
+        .prose p, .prose div {
+            margin-bottom: 0.75rem;
+        }
     </style>
     <script>
         // Simple shim for libraries expecting Node-like environments

@@ -31,7 +31,7 @@ import {
   Clock
 } from 'lucide-react';
 import { AppState, ParsedDocument, Chapter, Message, KeyInformation, AnalysisState, ConflictField, RiskCategory, RISK_CATEGORY_LABELS, RISK_CATEGORY_DESC, InvalidationRisk } from './types';
-import { extractPerfectStructure, downloadJson } from './services/docxParser';
+import { parseDocument, downloadJson } from './services/docxParser';
 import { GoogleGenAI } from "@google/genai";
 import { ApiKeyModal, getStoredApiKey } from './components/ApiKeyModal';
 import { analyzeBidDocument } from './services/hybridAnalysis';
@@ -87,6 +87,12 @@ const App: React.FC = () => {
   const [keyInfo, setKeyInfo] = useState<KeyInformation | null>(null);
   const [showAnalysisPanel, setShowAnalysisPanel] = useState(false);
   const [activeAnalysisTab, setActiveAnalysisTab] = useState<'basic' | 'risks' | 'scoring' | 'technical' | 'format'>('basic');
+  
+  // 深度分析取消控制
+  const abortControllerRef = useRef<AbortController | null>(null);
+  
+  // 文档指纹（用于缓存）
+  const [docFingerprint, setDocFingerprint] = useState<string | null>(null);
 
   // Load API Key from localStorage on mount
   useEffect(() => {
@@ -115,35 +121,164 @@ const App: React.FC = () => {
     const file = event.target.files?.[0];
     if (!file) return;
 
-    if (file.name.toLowerCase().endsWith('.doc')) {
-      alert('抱歉，本工具仅支持现代 .docx 格式。请将您的 .doc 文件在 Word 中另存为 .docx 后再试。');
+    const fileName = file.name.toLowerCase();
+    
+    // 检查文件格式
+    if (fileName.endsWith('.doc')) {
+      alert('抱歉，不支持旧版 .doc 格式。请将文件另存为 .docx 或转换为 PDF 后再试。');
+      return;
+    }
+    
+    if (!fileName.endsWith('.docx') && !fileName.endsWith('.pdf')) {
+      alert('请上传 .docx 或 .pdf 格式的文件');
       return;
     }
 
     try {
       setState(AppState.PARSING);
-      const parsed = await extractPerfectStructure(file);
+      // 重置分析状态
+      setKeyInfo(null);
+      setShowAnalysisPanel(false);
+      setAnalysisState(AnalysisState.IDLE);
+      
+      const parsed = await parseDocument(file);
       setDoc(parsed);
       if (parsed.chapters.length > 0) {
         setActiveChapterId(parsed.chapters[0].id);
       }
       setState(AppState.VIEWING);
       setMessages([]);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Parsing failed:', error);
+      alert(error.message || '文件解析失败');
       setState(AppState.ERROR);
     }
   };
 
-  const handleExportJson = () => {
-    if (doc) {
-      downloadJson(doc, `${doc.name.replace('.docx', '')}_parsed.json`);
+  const handleExportAnalysis = () => {
+    if (!keyInfo) {
+      alert('请先进行深度分析后再导出报告');
+      return;
+    }
+    
+    // 构建精炼的分析报告
+    const report = {
+      exportTime: new Date().toISOString(),
+      documentName: doc?.name || '未知文档',
+      
+      // 基本信息（转换为简单对象）
+      basicInfo: {
+        projectName: keyInfo.basicInfo.projectName.value,
+        projectCode: keyInfo.basicInfo.projectCode.value,
+        purchaser: keyInfo.basicInfo.purchaser.value,
+        agency: keyInfo.basicInfo.agency.value,
+        deadline: keyInfo.basicInfo.deadline.value,
+        budget: keyInfo.basicInfo.budget.value,
+        location: keyInfo.basicInfo.location.value,
+        validity: keyInfo.basicInfo.validity.value,
+        bond: keyInfo.basicInfo.bond.value,
+      },
+      
+      // 废标风险项
+      invalidationRisks: keyInfo.invalidationRisks.map(r => ({
+        category: r.category,
+        severity: r.severity,
+        originalText: r.originalText,
+        chapterTitle: r.chapterTitle,
+        aiAnalysis: r.aiAnalysis
+      })),
+      
+      // 风险统计
+      riskSummary: {
+        total: keyInfo.invalidationRisks.length,
+        highRisk: keyInfo.invalidationRisks.filter(r => r.severity === 'high').length,
+        mediumRisk: keyInfo.invalidationRisks.filter(r => r.severity === 'medium').length,
+        byCategory: {
+          qualification: keyInfo.invalidationRisks.filter(r => r.category === 'qualification').length,
+          commercial: keyInfo.invalidationRisks.filter(r => r.category === 'commercial').length,
+          technical: keyInfo.invalidationRisks.filter(r => r.category === 'technical').length,
+          document: keyInfo.invalidationRisks.filter(r => r.category === 'document').length,
+          timeline: keyInfo.invalidationRisks.filter(r => r.category === 'timeline').length,
+          other: keyInfo.invalidationRisks.filter(r => r.category === 'other').length,
+        }
+      },
+      
+      // 审计逻辑
+      auditLogic: keyInfo.auditLogic
+    };
+    
+    downloadJson(report, `${doc?.name.replace('.docx', '') || 'analysis'}_分析报告.json`);
+  };
+
+  // 生成文档指纹（用于缓存）
+  const generateDocFingerprint = (document: ParsedDocument): string => {
+    const content = document.chapters.map(c => c.title).join('|');
+    // 简单的哈希函数
+    let hash = 0;
+    for (let i = 0; i < content.length; i++) {
+      const char = content.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    return `doc_${document.name}_${hash}`;
+  };
+
+  // 获取缓存的分析结果
+  const getCachedAnalysis = (fingerprint: string): KeyInformation | null => {
+    try {
+      const cached = localStorage.getItem(`analysis_cache_${fingerprint}`);
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    } catch (e) {
+      console.error('Failed to read cache:', e);
+    }
+    return null;
+  };
+
+  // 保存分析结果到缓存
+  const saveAnalysisToCache = (fingerprint: string, result: KeyInformation) => {
+    try {
+      localStorage.setItem(`analysis_cache_${fingerprint}`, JSON.stringify(result));
+    } catch (e) {
+      console.error('Failed to save cache:', e);
+    }
+  };
+
+  // 取消深度分析
+  const cancelDeepAnalysis = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setAnalysisState(AnalysisState.IDLE);
+    setShowAnalysisPanel(false);  // 关闭分析面板，显示文档内容
+  };
+
+  // 关闭分析面板
+  const closeAnalysisPanel = () => {
+    setShowAnalysisPanel(false);
+    // 保持 analysisState 为 COMPLETED（如果已完成），这样再次打开时不会重新分析
+    // 但如果是 ANALYZING 状态（不应该发生），重置为 IDLE
+    if (analysisState === AnalysisState.ANALYZING) {
+      setAnalysisState(AnalysisState.IDLE);
     }
   };
 
   // 深度分析处理函数
-  const handleDeepAnalysis = async () => {
+  const handleDeepAnalysis = async (forceRefresh: boolean = false) => {
     if (!doc) return;
+    
+    // 如果当前会话已有分析结果，直接显示（不消耗 Token）
+    if (keyInfo && !forceRefresh) {
+      // 确保状态正确，然后显示面板
+      if (analysisState === AnalysisState.ANALYZING) {
+        // 不应该发生，但以防万一
+        setAnalysisState(AnalysisState.COMPLETED);
+      }
+      setShowAnalysisPanel(true);
+      return;
+    }
     
     const activeKey = getActiveApiKey();
     if (!activeKey) {
@@ -152,16 +287,54 @@ const App: React.FC = () => {
       return;
     }
 
+    // 生成文档指纹
+    const fingerprint = generateDocFingerprint(doc);
+    setDocFingerprint(fingerprint);
+
+    // 检查 localStorage 缓存（非强制刷新时）
+    if (!forceRefresh) {
+      const cached = getCachedAnalysis(fingerprint);
+      if (cached) {
+        const useCache = window.confirm(
+          '检测到该文档已有分析结果缓存。\n\n点击"确定"使用缓存结果（免费）\n点击"取消"重新分析（消耗 Token）'
+        );
+        if (useCache) {
+          setKeyInfo(cached);
+          setAnalysisState(AnalysisState.COMPLETED);
+          setShowAnalysisPanel(true);
+          return;
+        }
+      }
+    }
+
+    // 创建新的 AbortController
+    abortControllerRef.current = new AbortController();
+
     setAnalysisState(AnalysisState.ANALYZING);
     setShowAnalysisPanel(true);
 
     try {
-      const result = await analyzeBidDocument(doc, activeKey);
+      const result = await analyzeBidDocument(doc, activeKey, abortControllerRef.current.signal);
+      
+      // 检查是否被取消
+      if (abortControllerRef.current?.signal.aborted) {
+        return;
+      }
+      
       setKeyInfo(result);
       setAnalysisState(AnalysisState.COMPLETED);
-    } catch (error) {
+      
+      // 保存到缓存
+      saveAnalysisToCache(fingerprint, result);
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Analysis cancelled by user');
+        return;
+      }
       console.error('Deep analysis failed:', error);
       setAnalysisState(AnalysisState.ERROR);
+    } finally {
+      abortControllerRef.current = null;
     }
   };
 
@@ -195,14 +368,42 @@ const App: React.FC = () => {
     return titleMatch || contentMatch;
   }) || [];
   
-  // 判断搜索结果是标题匹配还是内容匹配
-  const getMatchType = (chapter: Chapter): 'title' | 'content' | null => {
-    if (!searchQuery.trim()) return null;
+  // 判断搜索结果是标题匹配还是内容匹配，并返回匹配片段
+  const getMatchInfo = (chapter: Chapter): { type: 'title' | 'content' | null; snippet: string | null } => {
+    if (!searchQuery.trim()) return { type: null, snippet: null };
     const query = searchQuery.toLowerCase();
-    if (chapter.title.toLowerCase().includes(query)) return 'title';
-    const plainContent = chapter.content.replace(/<[^>]*>/g, '').toLowerCase();
-    if (plainContent.includes(query)) return 'content';
-    return null;
+    
+    // 标题匹配
+    if (chapter.title.toLowerCase().includes(query)) {
+      return { type: 'title', snippet: null };
+    }
+    
+    // 内容匹配 - 提取匹配片段
+    const plainContent = chapter.content.replace(/<[^>]*>/g, '');
+    const lowerContent = plainContent.toLowerCase();
+    const matchIndex = lowerContent.indexOf(query);
+    
+    if (matchIndex !== -1) {
+      // 提取匹配位置前后的文本作为片段
+      const start = Math.max(0, matchIndex - 20);
+      const end = Math.min(plainContent.length, matchIndex + query.length + 40);
+      let snippet = plainContent.substring(start, end).trim();
+      
+      // 添加省略号
+      if (start > 0) snippet = '...' + snippet;
+      if (end < plainContent.length) snippet = snippet + '...';
+      
+      return { type: 'content', snippet };
+    }
+    
+    return { type: null, snippet: null };
+  };
+  
+  // 高亮搜索关键词
+  const highlightSearchTerm = (text: string): string => {
+    if (!searchQuery.trim()) return text;
+    const regex = new RegExp(`(${searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    return text.replace(regex, '<mark class="bg-yellow-200 text-yellow-900 px-0.5 rounded">$1</mark>');
   };
 
   const handleSendMessage = async () => {
@@ -271,8 +472,10 @@ const App: React.FC = () => {
 
   return (
     <div className="flex h-screen bg-slate-50 text-slate-900 overflow-hidden relative">
-      {/* 分析进行中遮罩 */}
-      {analysisState === AnalysisState.ANALYZING && <AnalyzingOverlay />}
+      {/* 分析进行中遮罩 - 只在真正分析中且有 AbortController 时显示 */}
+      {analysisState === AnalysisState.ANALYZING && abortControllerRef.current && (
+        <AnalyzingOverlay onCancel={cancelDeepAnalysis} />
+      )}
 
       {/* API Key Modal */}
       <ApiKeyModal
@@ -303,7 +506,7 @@ const App: React.FC = () => {
           
           <nav className="flex-1 overflow-y-auto p-4 space-y-1">
             {filteredChapters.map((chapter) => {
-              const matchType = getMatchType(chapter);
+              const matchInfo = getMatchInfo(chapter);
               return (
                 <button
                   key={chapter.id}
@@ -315,21 +518,39 @@ const App: React.FC = () => {
                   }`}
                 >
                   <div className="flex-1 min-w-0">
-                    <span className="text-sm font-medium line-clamp-2">{chapter.title}</span>
-                    {matchType === 'content' && searchQuery.trim() && (
-                      <span className="text-xs text-green-600 flex items-center gap-1 mt-1">
-                        <Search size={10} />
-                        内容匹配
-                      </span>
+                    {/* 标题 - 高亮搜索词 */}
+                    <span 
+                      className="text-sm font-medium line-clamp-2"
+                      dangerouslySetInnerHTML={{ 
+                        __html: searchQuery.trim() ? highlightSearchTerm(chapter.title) : chapter.title 
+                      }}
+                    />
+                    {/* 内容匹配时显示片段预览 */}
+                    {matchInfo.type === 'content' && matchInfo.snippet && (
+                      <div className="mt-1.5 p-2 bg-green-50 rounded-lg border border-green-100">
+                        <div className="text-xs text-green-600 flex items-center gap-1 mb-1">
+                          <Search size={10} />
+                          内容匹配
+                        </div>
+                        <p 
+                          className="text-xs text-slate-600 line-clamp-2"
+                          dangerouslySetInnerHTML={{ __html: highlightSearchTerm(matchInfo.snippet) }}
+                        />
+                      </div>
                     )}
                   </div>
-                  {activeChapterId === chapter.id && <ChevronRight size={16} />}
+                  {activeChapterId === chapter.id && <ChevronRight size={16} className="shrink-0 ml-2" />}
                 </button>
               );
             })}
             {filteredChapters.length === 0 && (
               <div className="text-center py-10 text-slate-400 text-sm">
                 未找到匹配结果
+              </div>
+            )}
+            {filteredChapters.length > 0 && searchQuery.trim() && (
+              <div className="text-center py-2 text-slate-400 text-xs">
+                找到 {filteredChapters.length} 个匹配章节
               </div>
             )}
           </nav>
@@ -353,11 +574,16 @@ const App: React.FC = () => {
               )}
             </button>
             <button 
-              onClick={handleExportJson}
-              className="w-full flex items-center justify-center gap-2 py-2 px-4 bg-white border border-slate-200 rounded-lg text-sm font-medium hover:bg-slate-50 transition-colors shadow-sm"
+              onClick={handleExportAnalysis}
+              disabled={!keyInfo}
+              className={`w-full flex items-center justify-center gap-2 py-2 px-4 rounded-lg text-sm font-medium transition-colors shadow-sm ${
+                keyInfo 
+                  ? 'bg-white border border-slate-200 hover:bg-slate-50' 
+                  : 'bg-slate-100 border border-slate-200 text-slate-400 cursor-not-allowed'
+              }`}
             >
               <Download size={16} />
-              导出 JSON
+              导出分析报告
             </button>
           </div>
         </aside>
@@ -418,15 +644,15 @@ const App: React.FC = () => {
               <div className="flex flex-col items-end">
                 <label className="cursor-pointer bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 shadow-lg shadow-blue-200">
                   <FileUp size={18} />
-                  上传招标文件 (.docx)
+                  上传招标文件
                   <input 
                     type="file" 
-                    accept=".docx" 
+                    accept=".docx,.pdf" 
                     className="hidden" 
                     onChange={handleFileUpload} 
                   />
                 </label>
-                <span className="text-[10px] text-slate-400 mt-1 mr-1">※ 不支持旧版 .doc 格式</span>
+                <span className="text-[10px] text-slate-400 mt-1 mr-1">支持 .docx / .pdf 格式</span>
               </div>
             )}
           </div>
@@ -441,12 +667,12 @@ const App: React.FC = () => {
               </div>
               <h2 className="text-3xl font-bold text-slate-800 mb-4">开始结构化解析</h2>
               <p className="text-slate-500 mb-6 leading-relaxed text-lg">
-                上传您的现代 Word 文档 (<b>.docx</b>)，系统将自动过滤目录干扰、智能提取章节结构、还原复杂表格，并高亮标注填空项。
+                上传您的招标文件 (<b>.docx</b> 或 <b>.pdf</b>)，系统将自动过滤目录干扰、智能提取章节结构，并高亮标注填空项。
               </p>
               
-              <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 border border-amber-100 rounded-xl text-amber-800 text-sm mb-10">
-                <AlertCircle size={18} className="shrink-0" />
-                <span><b>注意：</b> 不支持 2003 版及更早的 .doc 二进制格式。请先在 Word 中将其“另存为” .docx 文件。</span>
+              <div className="flex items-center gap-2 px-4 py-2 bg-blue-50 border border-blue-100 rounded-xl text-blue-800 text-sm mb-10">
+                <Info size={18} className="shrink-0" />
+                <span><b>支持格式：</b> .docx（推荐）、.pdf | 不支持旧版 .doc 格式</span>
               </div>
 
               <div className="grid grid-cols-2 gap-4 w-full text-left">
@@ -489,7 +715,7 @@ const App: React.FC = () => {
                 activeTab={activeAnalysisTab}
                 onTabChange={setActiveAnalysisTab}
                 onConflictResolve={(key, value) => handleConflictResolve(key as keyof KeyInformation['basicInfo'], value)}
-                onClose={() => setShowAnalysisPanel(false)}
+                onClose={closeAnalysisPanel}
               />
             </div>
           )}
@@ -502,7 +728,12 @@ const App: React.FC = () => {
                     <span className="inline-block px-3 py-1 bg-blue-100 text-blue-700 rounded-lg text-xs font-bold uppercase tracking-wider mb-2">
                       当前章节
                     </span>
-                    <h2 className="text-3xl font-bold text-slate-900">{activeChapter.title}</h2>
+                    <h2 
+                      className="text-3xl font-bold text-slate-900"
+                      dangerouslySetInnerHTML={{ 
+                        __html: searchQuery.trim() ? highlightSearchTerm(activeChapter.title) : activeChapter.title 
+                      }}
+                    />
                   </div>
                   {keyInfo && (
                     <button
@@ -514,11 +745,28 @@ const App: React.FC = () => {
                     </button>
                   )}
                 </div>
+                {/* 搜索提示 */}
+                {searchQuery.trim() && (
+                  <div className="mt-4 flex items-center gap-2 text-sm text-amber-700 bg-amber-50 px-3 py-2 rounded-lg">
+                    <Search size={14} />
+                    <span>正在高亮显示: <strong>"{searchQuery}"</strong></span>
+                    <button 
+                      onClick={() => setSearchQuery('')}
+                      className="ml-auto text-amber-600 hover:text-amber-800"
+                    >
+                      清除搜索
+                    </button>
+                  </div>
+                )}
               </div>
               
               <div 
                 className="prose prose-slate max-w-none text-slate-700 leading-8"
-                dangerouslySetInnerHTML={{ __html: activeChapter.content }} 
+                dangerouslySetInnerHTML={{ 
+                  __html: searchQuery.trim() 
+                    ? highlightSearchTerm(activeChapter.content) 
+                    : activeChapter.content 
+                }} 
               />
             </div>
           )}
@@ -697,50 +945,45 @@ const ConflictFieldDisplay: React.FC<{
   );
 };
 
-// 风险项卡片组件
-const RiskCard: React.FC<{
-  risk: InvalidationRisk;
-  index: number;
-}> = ({ risk, index }) => (
-  <div className={`p-4 rounded-xl border ${
-    risk.severity === 'high' 
-      ? 'border-red-200 bg-red-50' 
-      : 'border-amber-200 bg-amber-50'
-  }`}>
-    <div className="flex items-start gap-3">
-      <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 text-sm font-bold ${
-        risk.severity === 'high' 
-          ? 'bg-red-500 text-white' 
-          : 'bg-amber-500 text-white'
-      }`}>
-        {index + 1}
-      </div>
-      <div className="flex-1 min-w-0">
-        <div className="flex flex-wrap items-center gap-2 mb-2">
-          <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-            risk.severity === 'high'
-              ? 'bg-red-100 text-red-700'
-              : 'bg-amber-100 text-amber-700'
-          }`}>
-            {risk.severity === 'high' ? '高风险' : '中风险'}
-          </span>
-          <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 flex items-center gap-1">
-            <FileText size={10} />
-            {risk.chapterTitle}
-          </span>
-        </div>
-        <p className="text-sm text-slate-800 mb-3 leading-relaxed bg-white/50 p-3 rounded-lg border border-slate-200">
-          {risk.originalText}
-        </p>
-        <div className="p-3 bg-white/70 rounded-lg border border-slate-200">
-          <div className="text-xs text-slate-500 mb-1 flex items-center gap-1">
-            <Bot size={12} />
-            AI 分析:
-          </div>
-          <p className="text-sm text-slate-700">{risk.aiAnalysis}</p>
-        </div>
-      </div>
-    </div>
+// 风险项表格组件
+const RiskTable: React.FC<{
+  risks: InvalidationRisk[];
+  startIndex: number;
+}> = ({ risks, startIndex }) => (
+  <div className="overflow-x-auto">
+    <table className="w-full border-collapse">
+      <thead>
+        <tr className="bg-slate-100">
+          <th className="w-[5%] px-3 py-3 text-left text-xs font-semibold text-slate-600 border-b border-slate-200">#</th>
+          <th className="w-[40%] px-3 py-3 text-left text-xs font-semibold text-slate-600 border-b border-slate-200">原文</th>
+          <th className="w-[40%] px-3 py-3 text-left text-xs font-semibold text-slate-600 border-b border-slate-200">AI 分析</th>
+          <th className="w-[15%] px-3 py-3 text-left text-xs font-semibold text-slate-600 border-b border-slate-200">来源</th>
+        </tr>
+      </thead>
+      <tbody>
+        {risks.map((risk, i) => (
+          <tr key={i} className="hover:bg-slate-50 transition-colors">
+            <td className="px-3 py-4 align-top border-b border-slate-100">
+              <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg bg-slate-200 text-slate-700 text-sm font-medium">
+                {startIndex + i}
+              </span>
+            </td>
+            <td className="px-3 py-4 align-top border-b border-slate-100">
+              <p className="text-sm text-slate-800 leading-relaxed">{risk.originalText}</p>
+            </td>
+            <td className="px-3 py-4 align-top border-b border-slate-100">
+              <p className="text-sm text-slate-600 leading-relaxed">{risk.aiAnalysis}</p>
+            </td>
+            <td className="px-3 py-4 align-top border-b border-slate-100">
+              <span className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-lg bg-blue-50 text-blue-700">
+                <FileText size={10} />
+                {risk.chapterTitle}
+              </span>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   </div>
 );
 
@@ -808,12 +1051,10 @@ const RiskCategoryGroup: React.FC<{
         </div>
       </button>
       
-      {/* 风险项列表 */}
+      {/* 风险项表格 */}
       {expanded && (
-        <div className="p-4 pt-0 space-y-3">
-          {risks.map((risk, i) => (
-            <RiskCard key={i} risk={risk} index={startIndex + i} />
-          ))}
+        <div className="p-4 pt-0">
+          <RiskTable risks={risks} startIndex={startIndex} />
         </div>
       )}
     </div>
@@ -836,7 +1077,7 @@ const AnalysisDashboard: React.FC<{
     { id: 'format', label: '格式要求', icon: <FileJson size={16} /> },
   ];
 
-  const conflictCount = Object.values(keyInfo.basicInfo).filter(f => f.isConflict).length;
+  const conflictCount = Object.values(keyInfo.basicInfo).filter((f: any) => f.isConflict).length;
   const highRiskCount = keyInfo.invalidationRisks.filter(r => r.severity === 'high').length;
 
   return (
@@ -1033,7 +1274,7 @@ const AnalysisDashboard: React.FC<{
 };
 
 // 分析进行中组件
-const AnalyzingOverlay: React.FC = () => (
+const AnalyzingOverlay: React.FC<{ onCancel: () => void }> = ({ onCancel }) => (
   <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center">
     <div className="bg-white rounded-2xl p-8 shadow-2xl max-w-md text-center">
       <div className="w-16 h-16 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-4">
@@ -1043,7 +1284,7 @@ const AnalyzingOverlay: React.FC = () => (
       <p className="text-slate-500 text-sm mb-4">
         正在执行 Regex 撒网 + AI 智能审计
       </p>
-      <div className="space-y-2 text-left text-sm">
+      <div className="space-y-2 text-left text-sm mb-6">
         <div className="flex items-center gap-2 text-slate-600">
           <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
           <span>Step A: Regex 提取风险候选项...</span>
@@ -1061,6 +1302,12 @@ const AnalyzingOverlay: React.FC = () => (
           <span>Step D: AI 审计分析中...</span>
         </div>
       </div>
+      <button
+        onClick={onCancel}
+        className="px-6 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm font-medium transition-colors"
+      >
+        取消分析
+      </button>
     </div>
   </div>
 );
