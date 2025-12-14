@@ -88,6 +88,13 @@ const App: React.FC = () => {
   const [showAnalysisPanel, setShowAnalysisPanel] = useState(false);
   const [activeAnalysisTab, setActiveAnalysisTab] = useState<'basic' | 'risks' | 'scoring' | 'technical' | 'format'>('basic');
   
+  // 风险定位状态
+  const [locatingRisk, setLocatingRisk] = useState<{
+    text: string;
+    chapterTitle: string;
+  } | null>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  
   // 深度分析取消控制
   const abortControllerRef = useRef<AbortController | null>(null);
   
@@ -177,6 +184,7 @@ const App: React.FC = () => {
         location: keyInfo.basicInfo.location.value,
         validity: keyInfo.basicInfo.validity.value,
         bond: keyInfo.basicInfo.bond.value,
+        biddingMethod: keyInfo.basicInfo.biddingMethod.value,
       },
       
       // 废标风险项
@@ -245,13 +253,24 @@ const App: React.FC = () => {
     }
   };
 
-  // 取消深度分析
+  // 取消深度分析（保存之前的有效结果引用）
+  const previousKeyInfoRef = useRef<KeyInformation | null>(null);
+  
   const cancelDeepAnalysis = () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
-    setAnalysisState(AnalysisState.IDLE);
+    
+    // 如果有之前的有效结果，恢复它
+    if (previousKeyInfoRef.current) {
+      setKeyInfo(previousKeyInfoRef.current);
+      setAnalysisState(AnalysisState.COMPLETED);
+      console.log('已恢复之前的分析结果');
+    } else {
+      setAnalysisState(AnalysisState.IDLE);
+    }
+    
     setShowAnalysisPanel(false);  // 关闭分析面板，显示文档内容
   };
 
@@ -271,11 +290,9 @@ const App: React.FC = () => {
     
     // 如果当前会话已有分析结果，直接显示（不消耗 Token）
     if (keyInfo && !forceRefresh) {
-      // 确保状态正确，然后显示面板
-      if (analysisState === AnalysisState.ANALYZING) {
-        // 不应该发生，但以防万一
-        setAnalysisState(AnalysisState.COMPLETED);
-      }
+      console.log('已有分析结果，直接显示');
+      // 确保状态为 COMPLETED，然后显示面板
+      setAnalysisState(AnalysisState.COMPLETED);
       setShowAnalysisPanel(true);
       return;
     }
@@ -307,6 +324,11 @@ const App: React.FC = () => {
       }
     }
 
+    // 保存之前的有效结果（用于取消时恢复）
+    if (keyInfo) {
+      previousKeyInfoRef.current = keyInfo;
+    }
+    
     // 创建新的 AbortController
     abortControllerRef.current = new AbortController();
 
@@ -318,17 +340,26 @@ const App: React.FC = () => {
       
       // 检查是否被取消
       if (abortControllerRef.current?.signal.aborted) {
+        console.log('Analysis was aborted, not updating state');
         return;
       }
       
       setKeyInfo(result);
       setAnalysisState(AnalysisState.COMPLETED);
       
+      // 分析成功后，清空之前的结果引用
+      previousKeyInfoRef.current = null;
+      
       // 保存到缓存
       saveAnalysisToCache(fingerprint, result);
     } catch (error: any) {
       if (error.name === 'AbortError') {
         console.log('Analysis cancelled by user');
+        // 恢复之前的结果（如果有）
+        if (previousKeyInfoRef.current) {
+          setKeyInfo(previousKeyInfoRef.current);
+          setAnalysisState(AnalysisState.COMPLETED);
+        }
         return;
       }
       console.error('Deep analysis failed:', error);
@@ -356,6 +387,63 @@ const App: React.FC = () => {
   };
 
   const activeChapter = doc?.chapters.find(c => c.id === activeChapterId);
+  
+  // 处理风险来源点击 - 定位并高亮
+  const handleRiskLocate = useCallback((risk: { text: string; chapterTitle: string }) => {
+    if (!doc) return;
+    
+    // 如果点击的是同一个风险，则取消定位
+    if (locatingRisk && locatingRisk.text === risk.text) {
+      setLocatingRisk(null);
+      return;
+    }
+    
+    // 查找包含该风险文本的章节
+    const targetChapter = doc.chapters.find(c => {
+      // 先按章节标题匹配
+      if (c.title.includes(risk.chapterTitle.replace(/第[一二三四五六七八九十\d]+[章节篇部]\s*/, ''))) {
+        return true;
+      }
+      // 如果标题不匹配，检查内容是否包含风险文本
+      const plainContent = c.content.replace(/<[^>]*>/g, '');
+      // 取风险文本的前30个字符进行模糊匹配
+      const searchText = risk.text.substring(0, 30);
+      return plainContent.includes(searchText);
+    });
+    
+    if (targetChapter) {
+      // 切换到该章节
+      setActiveChapterId(targetChapter.id);
+      // 设置定位状态
+      setLocatingRisk(risk);
+      
+      // 延迟滚动到高亮位置
+      setTimeout(() => {
+        const highlightEl = document.querySelector('.risk-highlight');
+        if (highlightEl) {
+          highlightEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }, 100);
+    } else {
+      // 未找到章节，仍然设置定位状态（会在当前章节尝试高亮）
+      setLocatingRisk(risk);
+    }
+  }, [doc, locatingRisk]);
+  
+  // 高亮风险文本的函数
+  const highlightRiskText = useCallback((html: string): string => {
+    if (!locatingRisk) return html;
+    
+    // 取风险文本的前50个字符进行匹配（避免过长导致匹配失败）
+    const searchText = locatingRisk.text.substring(0, 50).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    
+    try {
+      const regex = new RegExp(`(${searchText})`, 'gi');
+      return html.replace(regex, '<mark class="risk-highlight bg-red-200 text-red-900 px-1 rounded animate-pulse">$1</mark>');
+    } catch {
+      return html;
+    }
+  }, [locatingRisk]);
   
   // 搜索支持：标题 + 内容
   const filteredChapters = doc?.chapters.filter(c => {
@@ -440,7 +528,7 @@ const App: React.FC = () => {
       const context = `完整招标文件内容（共 ${doc.chapters.length} 个章节）:\n\n${fullContent}`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-lite',
+        model: 'gemini-2.5-flash',
         contents: `基于以下招标文件内容回答我的问题：\n\n【文档上下文】\n${context}\n\n【用户问题】\n${inputText}`,
         config: {
           systemInstruction: "你是一个专业的招标文件分析助手。请根据提供的招标文件内容回答用户的问题。回答要准确、客观、专业。如果文档中没有相关信息，请如实告知。请始终使用中文回答。",
@@ -708,7 +796,7 @@ const App: React.FC = () => {
             </div>
           )}
 
-          {state === AppState.VIEWING && showAnalysisPanel && keyInfo && (
+          {state === AppState.VIEWING && showAnalysisPanel && keyInfo && !locatingRisk && (
             <div className="max-w-5xl mx-auto">
               <AnalysisDashboard
                 keyInfo={keyInfo}
@@ -716,7 +804,58 @@ const App: React.FC = () => {
                 onTabChange={setActiveAnalysisTab}
                 onConflictResolve={(key, value) => handleConflictResolve(key as keyof KeyInformation['basicInfo'], value)}
                 onClose={closeAnalysisPanel}
+                onRiskLocate={handleRiskLocate}
               />
+            </div>
+          )}
+
+          {/* 风险定位模式：左右分栏布局 */}
+          {state === AppState.VIEWING && showAnalysisPanel && keyInfo && locatingRisk && activeChapter && (
+            <div className="flex gap-4 h-full">
+              {/* 左侧：原文内容 */}
+              <div className="flex-1 bg-white border border-slate-100 rounded-2xl shadow-sm p-6 overflow-auto" ref={contentRef}>
+                <div className="mb-4 pb-3 border-b border-slate-100">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="inline-block px-2 py-0.5 bg-red-100 text-red-700 rounded text-xs font-bold uppercase tracking-wider mb-1">
+                        风险定位
+                      </span>
+                      <h2 className="text-xl font-bold text-slate-900">{activeChapter.title}</h2>
+                    </div>
+                    <button
+                      onClick={() => setLocatingRisk(null)}
+                      className="flex items-center gap-1 px-3 py-1.5 bg-slate-100 text-slate-600 rounded-lg text-sm hover:bg-slate-200 transition-colors"
+                    >
+                      <X size={14} />
+                      取消定位
+                    </button>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-2">
+                    已高亮显示风险条款，点击右侧"来源"列可切换其他风险
+                  </p>
+                </div>
+                <div 
+                  className="prose prose-slate max-w-none text-slate-700 leading-7 text-sm"
+                  dangerouslySetInnerHTML={{ __html: highlightRiskText(activeChapter.content) }} 
+                />
+              </div>
+              
+              {/* 右侧：分析面板（紧凑模式） */}
+              <div className="w-[420px] flex-shrink-0">
+                <AnalysisDashboard
+                  keyInfo={keyInfo}
+                  activeTab="risks"
+                  onTabChange={setActiveAnalysisTab}
+                  onConflictResolve={(key, value) => handleConflictResolve(key as keyof KeyInformation['basicInfo'], value)}
+                  onClose={() => {
+                    setLocatingRisk(null);
+                    closeAnalysisPanel();
+                  }}
+                  onRiskLocate={handleRiskLocate}
+                  compact={true}
+                  locatingRiskText={locatingRisk.text}
+                />
+              </div>
             </div>
           )}
 
@@ -949,39 +1088,65 @@ const ConflictFieldDisplay: React.FC<{
 const RiskTable: React.FC<{
   risks: InvalidationRisk[];
   startIndex: number;
-}> = ({ risks, startIndex }) => (
+  onRiskLocate?: (risk: { text: string; chapterTitle: string }) => void;
+  compact?: boolean;
+  locatingRiskText?: string;
+}> = ({ risks, startIndex, onRiskLocate, compact, locatingRiskText }) => (
   <div className="overflow-x-auto">
     <table className="w-full border-collapse">
       <thead>
         <tr className="bg-slate-100">
-          <th className="w-[5%] px-3 py-3 text-left text-xs font-semibold text-slate-600 border-b border-slate-200">#</th>
-          <th className="w-[40%] px-3 py-3 text-left text-xs font-semibold text-slate-600 border-b border-slate-200">原文</th>
-          <th className="w-[40%] px-3 py-3 text-left text-xs font-semibold text-slate-600 border-b border-slate-200">AI 分析</th>
-          <th className="w-[15%] px-3 py-3 text-left text-xs font-semibold text-slate-600 border-b border-slate-200">来源</th>
+          <th className={`w-[5%] ${compact ? 'px-2 py-2' : 'px-3 py-3'} text-left text-xs font-semibold text-slate-600 border-b border-slate-200`}>#</th>
+          <th className={`${compact ? 'w-[50%] px-2 py-2' : 'w-[40%] px-3 py-3'} text-left text-xs font-semibold text-slate-600 border-b border-slate-200`}>原文</th>
+          {!compact && (
+            <th className="w-[40%] px-3 py-3 text-left text-xs font-semibold text-slate-600 border-b border-slate-200">AI 分析</th>
+          )}
+          <th className={`${compact ? 'w-[30%] px-2 py-2' : 'w-[15%] px-3 py-3'} text-left text-xs font-semibold text-slate-600 border-b border-slate-200`}>来源</th>
         </tr>
       </thead>
       <tbody>
-        {risks.map((risk, i) => (
-          <tr key={i} className="hover:bg-slate-50 transition-colors">
-            <td className="px-3 py-4 align-top border-b border-slate-100">
-              <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg bg-slate-200 text-slate-700 text-sm font-medium">
-                {startIndex + i}
-              </span>
-            </td>
-            <td className="px-3 py-4 align-top border-b border-slate-100">
-              <p className="text-sm text-slate-800 leading-relaxed">{risk.originalText}</p>
-            </td>
-            <td className="px-3 py-4 align-top border-b border-slate-100">
-              <p className="text-sm text-slate-600 leading-relaxed">{risk.aiAnalysis}</p>
-            </td>
-            <td className="px-3 py-4 align-top border-b border-slate-100">
-              <span className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-lg bg-blue-50 text-blue-700">
-                <FileText size={10} />
-                {risk.chapterTitle}
-              </span>
-            </td>
-          </tr>
-        ))}
+        {risks.map((risk, i) => {
+          const isLocating = locatingRiskText === risk.originalText;
+          return (
+            <tr 
+              key={i} 
+              className={`transition-colors ${isLocating ? 'bg-red-50 ring-2 ring-red-300 ring-inset' : 'hover:bg-slate-50'}`}
+            >
+              <td className={`${compact ? 'px-2 py-2' : 'px-3 py-4'} align-top border-b border-slate-100`}>
+                <span className={`inline-flex items-center justify-center ${compact ? 'w-5 h-5 text-xs' : 'w-7 h-7 text-sm'} rounded-lg ${isLocating ? 'bg-red-200 text-red-800' : 'bg-slate-200 text-slate-700'} font-medium`}>
+                  {startIndex + i}
+                </span>
+              </td>
+              <td className={`${compact ? 'px-2 py-2' : 'px-3 py-4'} align-top border-b border-slate-100`}>
+                <p className={`${compact ? 'text-xs' : 'text-sm'} text-slate-800 leading-relaxed ${compact ? 'line-clamp-3' : ''}`}>
+                  {risk.originalText}
+                </p>
+                {compact && (
+                  <p className="text-xs text-slate-500 mt-1 line-clamp-2">{risk.aiAnalysis}</p>
+                )}
+              </td>
+              {!compact && (
+                <td className="px-3 py-4 align-top border-b border-slate-100">
+                  <p className="text-sm text-slate-600 leading-relaxed">{risk.aiAnalysis}</p>
+                </td>
+              )}
+              <td className={`${compact ? 'px-2 py-2' : 'px-3 py-4'} align-top border-b border-slate-100`}>
+                <button
+                  onClick={() => onRiskLocate?.({ text: risk.originalText, chapterTitle: risk.chapterTitle })}
+                  className={`inline-flex items-center gap-1 text-xs px-2 py-1 rounded-lg transition-colors cursor-pointer ${
+                    isLocating 
+                      ? 'bg-red-100 text-red-700 ring-1 ring-red-300' 
+                      : 'bg-blue-50 text-blue-700 hover:bg-blue-100'
+                  }`}
+                  title={isLocating ? '点击取消定位' : '点击定位到原文'}
+                >
+                  <FileText size={10} />
+                  <span className={compact ? 'max-w-[80px] truncate' : ''}>{risk.chapterTitle}</span>
+                </button>
+              </td>
+            </tr>
+          );
+        })}
       </tbody>
     </table>
   </div>
@@ -992,7 +1157,10 @@ const RiskCategoryGroup: React.FC<{
   category: RiskCategory;
   risks: InvalidationRisk[];
   startIndex: number;
-}> = ({ category, risks, startIndex }) => {
+  onRiskLocate?: (risk: { text: string; chapterTitle: string }) => void;
+  compact?: boolean;
+  locatingRiskText?: string;
+}> = ({ category, risks, startIndex, onRiskLocate, compact, locatingRiskText }) => {
   const [expanded, setExpanded] = useState(true);
   
   const highCount = risks.filter(r => r.severity === 'high').length;
@@ -1053,8 +1221,14 @@ const RiskCategoryGroup: React.FC<{
       
       {/* 风险项表格 */}
       {expanded && (
-        <div className="p-4 pt-0">
-          <RiskTable risks={risks} startIndex={startIndex} />
+        <div className={compact ? "p-2 pt-0" : "p-4 pt-0"}>
+          <RiskTable 
+            risks={risks} 
+            startIndex={startIndex} 
+            onRiskLocate={onRiskLocate}
+            compact={compact}
+            locatingRiskText={locatingRiskText}
+          />
         </div>
       )}
     </div>
@@ -1068,7 +1242,10 @@ const AnalysisDashboard: React.FC<{
   onTabChange: (tab: 'basic' | 'risks' | 'scoring' | 'technical' | 'format') => void;
   onConflictResolve: (key: string, value: string) => void;
   onClose: () => void;
-}> = ({ keyInfo, activeTab, onTabChange, onConflictResolve, onClose }) => {
+  onRiskLocate?: (risk: { text: string; chapterTitle: string }) => void;
+  compact?: boolean;  // 紧凑模式（用于左右分栏）
+  locatingRiskText?: string;  // 当前定位的风险文本
+}> = ({ keyInfo, activeTab, onTabChange, onConflictResolve, onClose, onRiskLocate, compact, locatingRiskText }) => {
   const tabs = [
     { id: 'basic', label: '基本信息', icon: <ClipboardList size={16} /> },
     { id: 'risks', label: '废标风险', icon: <AlertTriangle size={16} />, count: keyInfo.invalidationRisks.length },
@@ -1153,6 +1330,7 @@ const AnalysisDashboard: React.FC<{
               <ConflictFieldDisplay label="项目编号" field={keyInfo.basicInfo.projectCode} fieldKey="projectCode" onResolve={onConflictResolve} />
               <ConflictFieldDisplay label="采购人" field={keyInfo.basicInfo.purchaser} fieldKey="purchaser" onResolve={onConflictResolve} />
               <ConflictFieldDisplay label="代理机构" field={keyInfo.basicInfo.agency} fieldKey="agency" onResolve={onConflictResolve} />
+              <ConflictFieldDisplay label="招标方式" field={keyInfo.basicInfo.biddingMethod} fieldKey="biddingMethod" onResolve={onConflictResolve} />
               <ConflictFieldDisplay label="投标截止时间" field={keyInfo.basicInfo.deadline} fieldKey="deadline" onResolve={onConflictResolve} />
               <ConflictFieldDisplay label="预算金额" field={keyInfo.basicInfo.budget} fieldKey="budget" onResolve={onConflictResolve} />
               <ConflictFieldDisplay label="开标地点" field={keyInfo.basicInfo.location} fieldKey="location" onResolve={onConflictResolve} />
@@ -1213,6 +1391,9 @@ const AnalysisDashboard: React.FC<{
                         category={cat} 
                         risks={risks} 
                         startIndex={startIdx + 1}
+                        onRiskLocate={onRiskLocate}
+                        compact={compact}
+                        locatingRiskText={locatingRiskText}
                       />
                     );
                   });

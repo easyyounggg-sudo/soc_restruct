@@ -98,6 +98,7 @@ export interface BasicInfo {
   location: ConflictField;          // 开标地点
   validity: ConflictField;          // 投标有效期
   bond: ConflictField;              // 保证金
+  biddingMethod: ConflictField;     // 招标方式
 }
 
 // 关键信息提取结果

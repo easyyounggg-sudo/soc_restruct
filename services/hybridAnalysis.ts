@@ -1,4 +1,3 @@
-import { GoogleGenAI } from "@google/genai";
 import { 
   ParsedDocument, 
   KeyInformation, 
@@ -9,12 +8,15 @@ import {
   AuditLogic
 } from '../types';
 
+// ==================== 后端 AI 代理配置 ====================
+const AI_PROXY_URL = 'http://localhost:8000/api/ai-analyze';
+
 // ==================== 常量定义 ====================
 
 // 高风险关键词（用于 Regex 撒网）
 const RISK_KEYWORDS = [
-  '废标', '无效', '拒绝', '★', '▲', '☆', '△',
-  '资格', '实质性', '否决', '不得', '不允许', '禁止',
+  '废标', '无效', '拒绝', '★', '▲', '☆', '△', '*', '※',
+  '实质性', '否决', '不得', '不允许', '禁止',
   '不予受理', '取消资格', '失效'
 ];
 
@@ -23,8 +25,8 @@ const CHAPTER_KEYWORDS = {
   notice: ['招标公告', '采购公告', '邀请书', '公告'],
   instructions: ['投标人须知', '须知', '投标须知', '说明'],
   scoring: ['评分', '评审', '打分', '评标'],
-  technical: ['采购需求', '技术要求', '技术需求', '技术规格', '技术参数', '设备配置', '货物需求', '项目需求', '服务需求'],
-  format: ['投标文件格式', '投标文件的格式', '响应文件格式', '响应文件的格式', '文件组成', '投标文件的组成', '响应文件组成', '投标文件编制', '文件格式'],
+  technical: ['技术要求', '技术需求', '技术规格', '技术参数', '设备配置', '货物需求'],
+  format: ['投标文件格式', '响应文件格式', '文件组成', '投标文件的组成', '响应文件组成', '投标文件编制'],
   qualification: ['资格', '资质', '条件']
 };
 
@@ -36,23 +38,50 @@ const EXCLUDE_KEYWORDS = {
 
 // ==================== Step A: Regex 撒网（风险候选项）====================
 
+// ★/▲ 符号的正则模式（匹配包含这些符号的完整条款）
+const STAR_PATTERN = /[★▲☆△※\*][^\n]*(?:[\n][^\n★▲☆△※\*]*)?/g;
+
 function extractRiskCandidates(doc: ParsedDocument): RawRiskCandidate[] {
   const candidates: RawRiskCandidate[] = [];
+  const seenTexts = new Set<string>();
   
   for (const chapter of doc.chapters) {
     // 移除 HTML 标签，获取纯文本
     const plainText = chapter.content.replace(/<[^>]*>/g, '');
     
-    // 按段落分割（以句号、换行等为界）
-    const paragraphs = plainText.split(/[。\n\r]+/).filter(p => p.trim().length > 10);
+    // === 专门提取 ★/▲ 符号条款 ===
+    // 这些符号通常标记关键参数，需要完整提取
+    const starMatches = plainText.match(STAR_PATTERN) || [];
+    for (const match of starMatches) {
+      const text = match.trim();
+      if (text.length > 5 && text.length < 500 && !seenTexts.has(text)) {
+        seenTexts.add(text);
+        // 判断具体匹配到哪个符号
+        const matchedSymbol = ['★', '▲', '☆', '△', '※', '*'].find(s => text.includes(s)) || '★';
+        candidates.push({
+          text: text,
+          chapterTitle: chapter.title,
+          matchedKeyword: matchedSymbol
+        });
+      }
+    }
+    
+    // === 按段落分割提取其他风险关键词 ===
+    // 使用更灵活的分割：句号、分号、换行
+    const paragraphs = plainText.split(/[。；\n\r]+/).filter(p => p.trim().length > 10);
     
     for (const para of paragraphs) {
+      const trimmedPara = para.trim();
+      
+      // 跳过已通过★模式提取的内容
+      if (seenTexts.has(trimmedPara)) continue;
+      
       for (const keyword of RISK_KEYWORDS) {
-        if (para.includes(keyword)) {
-          // 避免重复添加同一段落
-          if (!candidates.some(c => c.text === para.trim())) {
+        if (trimmedPara.includes(keyword)) {
+          if (!seenTexts.has(trimmedPara)) {
+            seenTexts.add(trimmedPara);
             candidates.push({
-              text: para.trim(),
+              text: trimmedPara,
               chapterTitle: chapter.title,
               matchedKeyword: keyword
             });
@@ -62,6 +91,8 @@ function extractRiskCandidates(doc: ParsedDocument): RawRiskCandidate[] {
       }
     }
   }
+  
+  console.log(`[Step A] 提取到 ${candidates.filter(c => ['★','▲','☆','△','※','*'].includes(c.matchedKeyword)).length} 条 ★/▲ 符号条款`);
   
   return candidates;
 }
@@ -78,6 +109,7 @@ interface RegexInfo {
   location: string | null;
   validity: string | null;
   bond: string | null;
+  biddingMethod: string | null;  // 新增：招标方式
 }
 
 function extractBasicInfoByRegex(rawHtml: string): RegexInfo {
@@ -94,40 +126,71 @@ function extractBasicInfoByRegex(rawHtml: string): RegexInfo {
     return null;
   };
   
+  // 智能提取：遇到常见字段名或特殊符号时停止
+  const extractUntilNextField = (patterns: RegExp[]): string | null => {
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match && match[1]) {
+        let value = match[1].trim();
+        // 在遇到下一个字段标识时截断
+        const stopPatterns = [
+          /[（\(][一二三四五六七八九十\d]+[）\)]/,  // (一) (1)
+          /[一二三四五六七八九十\d]+[、．.]/,  // 一、 1.
+          /项目编号|采购编号|招标编号/,
+          /项目内容|服务名称|服务期限|包号|分包/,
+          /采购人|招标人|代理机构/
+        ];
+        for (const stopPattern of stopPatterns) {
+          const stopMatch = value.match(stopPattern);
+          if (stopMatch && stopMatch.index !== undefined && stopMatch.index > 0) {
+            value = value.substring(0, stopMatch.index).trim();
+          }
+        }
+        // 去除尾部可能的冗余字符
+        value = value.replace(/[：:,，\s]+$/, '');
+        if (value.length >= 5 && value.length <= 80) {
+          return value;
+        }
+      }
+    }
+    return null;
+  };
+  
   return {
-    // 项目名称
-    projectName: extract([
-      /项目名称[：:]\s*([^，。\n]{5,100})/,
-      /采购项目[：:]\s*([^，。\n]{5,100})/,
-      /工程名称[：:]\s*([^，。\n]{5,100})/
+    // 项目名称（使用智能提取，遇到字段标识时停止）
+    projectName: extractUntilNextField([
+      /项目名称[：:]\s*([^。\n]{5,150})/,
+      /采购项目[：:]\s*([^。\n]{5,150})/,
+      /工程名称[：:]\s*([^。\n]{5,150})/
     ]),
     
-    // 项目编号
+    // 项目编号（更精确的匹配）
     projectCode: extract([
-      /项目编号[：:]\s*([A-Za-z0-9\-_]{5,50})/,
-      /采购编号[：:]\s*([A-Za-z0-9\-_]{5,50})/,
-      /招标编号[：:]\s*([A-Za-z0-9\-_]{5,50})/
+      /项目编号[：:]\s*([A-Za-z0-9\-_]+(?:\s*[\-_]\s*[A-Za-z0-9]+)*)/,
+      /采购编号[：:]\s*([A-Za-z0-9\-_]+(?:\s*[\-_]\s*[A-Za-z0-9]+)*)/,
+      /招标编号[：:]\s*([A-Za-z0-9\-_]+(?:\s*[\-_]\s*[A-Za-z0-9]+)*)/
     ]),
     
-    // 采购人
+    // 采购人（限制长度，排除常见干扰词）
     purchaser: extract([
-      /采购人[：:]\s*([^，。\n]{2,50})/,
-      /招标人[：:]\s*([^，。\n]{2,50})/,
-      /业主单位[：:]\s*([^，。\n]{2,50})/
+      /采购人[（\(]?甲方[）\)]?[：:]\s*([^，。\n（\(]{2,40})/,
+      /采购人[：:]\s*([^，。\n（\(]{2,40})/,
+      /招标人[：:]\s*([^，。\n（\(]{2,40})/,
+      /业主单位[：:]\s*([^，。\n（\(]{2,40})/
     ]),
     
     // 代理机构
     agency: extract([
-      /代理机构[：:]\s*([^，。\n]{2,80})/,
-      /招标代理[：:]\s*([^，。\n]{2,80})/,
-      /采购代理[：:]\s*([^，。\n]{2,80})/
+      /代理机构[：:]\s*([^，。\n]{2,60})/,
+      /招标代理[：:]\s*([^，。\n]{2,60})/,
+      /采购代理[机构]*[：:]\s*([^，。\n]{2,60})/
     ]),
     
     // 投标截止时间
     deadline: extract([
-      /投标截止时间[：:]\s*([\d年月日时分秒\s:：\-]+)/,
-      /截止时间[：:]\s*([\d年月日时分秒\s:：\-]+)/,
-      /开标时间[：:]\s*([\d年月日时分秒\s:：\-]+)/,
+      /投标截止时间[：:]\s*([\d年月日时分秒\s:：\-\/]+)/,
+      /截止时间[：:]\s*([\d年月日时分秒\s:：\-\/]+)/,
+      /开标时间[：:]\s*([\d年月日时分秒\s:：\-\/]+)/,
       /(\d{4}[\-\/年]\d{1,2}[\-\/月]\d{1,2}日?\s*\d{1,2}[：:]\d{2})/
     ]),
     
@@ -136,27 +199,37 @@ function extractBasicInfoByRegex(rawHtml: string): RegexInfo {
       /预算金额[：:]\s*([\d,，.]+\s*万?元)/,
       /最高限价[：:]\s*([\d,，.]+\s*万?元)/,
       /采购预算[：:]\s*([\d,，.]+\s*万?元)/,
-      /预算[：:]\s*([\d,，.]+\s*万?元)/,
+      /项目预算[：:]\s*([\d,，.]+\s*万?元)/,
       /控制价[：:]\s*([\d,，.]+\s*万?元)/
     ]),
     
     // 开标地点
     location: extract([
-      /开标地点[：:]\s*([^，。\n]{5,100})/,
-      /投标地点[：:]\s*([^，。\n]{5,100})/,
-      /会议室[：:]\s*([^，。\n]{5,100})/
+      /开标地点[：:]\s*([^，。\n]{5,80})/,
+      /投标地点[：:]\s*([^，。\n]{5,80})/,
+      /评标地点[：:]\s*([^，。\n]{5,80})/
     ]),
     
     // 投标有效期
     validity: extract([
       /投标有效期[：:]\s*([\d]+\s*[天日个月年]+)/,
+      /投标有效期[为]*([\d]+\s*[天日个月年]+)/,
       /有效期[：:]\s*([\d]+\s*[天日个月年]+)/
     ]),
     
     // 保证金
     bond: extract([
-      /投标保证金[：:]\s*([\d,，.]+\s*万?元|不[需提交要求]+)/,
-      /保证金[：:]\s*([\d,，.]+\s*万?元|不[需提交要求]+)/
+      /投标保证金[：:]\s*([\d,，.]+\s*万?元)/,
+      /保证金金额[：:]\s*([\d,，.]+\s*万?元)/,
+      /保证金[：:]\s*([\d,，.]+\s*万?元|不[需要求提交]+|免[收交缴]+)/
+    ]),
+    
+    // 招标方式（新增）
+    biddingMethod: extract([
+      /采购方式[：:]\s*(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源|询价采购|框架协议)/,
+      /招标方式[：:]\s*(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源|询价采购|框架协议)/,
+      /本项目采用\s*(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源|询价采购)/,
+      /(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源采购|询价采购)[方式]*进行采购/
     ])
   };
 }
@@ -298,52 +371,48 @@ interface AIAnalysisResult {
 async function performAIAnalysis(
   doc: ParsedDocument,
   rawRiskCandidates: RawRiskCandidate[],
-  apiKey: string,
-  retryCount: number = 0
+  _apiKey: string,  // 不再使用，API Key 在后端
+  signal?: AbortSignal  // 用于取消请求
 ): Promise<AIAnalysisResult | null> {
-  const MAX_RETRIES = 3;
   
-  try {
-    const ai = new GoogleGenAI({ apiKey });
-    
-    // 获取招标公告和投标须知章节的内容
-    const noticeChapter = doc.chapters.find(c => 
-      CHAPTER_KEYWORDS.notice.some(kw => c.title.includes(kw))
-    );
-    const instructionsChapter = doc.chapters.find(c => 
-      CHAPTER_KEYWORDS.instructions.some(kw => c.title.includes(kw))
-    );
-    
-    // 限制内容大小，避免请求过大
-    const maxContentLength = 6000;  // 减少到 6000 字符
-    const noticeText = noticeChapter 
-      ? noticeChapter.content.replace(/<[^>]*>/g, '').substring(0, maxContentLength)
-      : '';
-    const instructionsText = instructionsChapter 
-      ? instructionsChapter.content.replace(/<[^>]*>/g, '').substring(0, maxContentLength)
-      : '';
-    
-    // 构建风险候选项列表（优先 ★/▲ 相关的条款）
-    const maxRisks = 50;  // 增加到 50 条
-    const maxTextLen = 180;  // 每条最多 180 字符
-    
-    // 分离 ★/▲ 相关和其他风险
-    const starRisks = rawRiskCandidates.filter(r => 
-      r.text.includes('★') || r.text.includes('▲') || r.text.includes('☆') || r.text.includes('△')
-    );
-    const otherRisks = rawRiskCandidates.filter(r => 
-      !r.text.includes('★') && !r.text.includes('▲') && !r.text.includes('☆') && !r.text.includes('△')
-    );
-    
-    // 优先使用 ★/▲ 相关的，再补充其他的
-    const prioritizedRisks = [...starRisks, ...otherRisks].slice(0, maxRisks);
-    console.log(`   ★/▲ 相关候选项: ${starRisks.length} 条`);
-    
-    const riskList = prioritizedRisks.map((r, i) => 
-      `[${i + 1}] 章节「${r.chapterTitle}」: ${r.text.substring(0, maxTextLen)}`
-    ).join('\n');
-    
-    const systemPrompt = `# Role: 资深标书合规审计师 (Senior Bid Compliance Auditor)
+  // 获取招标公告和投标须知章节的内容
+  const noticeChapter = doc.chapters.find(c => 
+    CHAPTER_KEYWORDS.notice.some(kw => c.title.includes(kw))
+  );
+  const instructionsChapter = doc.chapters.find(c => 
+    CHAPTER_KEYWORDS.instructions.some(kw => c.title.includes(kw))
+  );
+  
+  // 限制内容大小，避免请求过大
+  const maxContentLength = 6000;
+  const noticeText = noticeChapter 
+    ? noticeChapter.content.replace(/<[^>]*>/g, '').substring(0, maxContentLength)
+    : '';
+  const instructionsText = instructionsChapter 
+    ? instructionsChapter.content.replace(/<[^>]*>/g, '').substring(0, maxContentLength)
+    : '';
+  
+  // 构建风险候选项列表（优先 ★/▲ 相关的条款）
+  const maxRisks = 80;
+  const maxTextLen = 200;
+  
+  // 分离 ★/▲ 相关和其他风险
+  const starRisks = rawRiskCandidates.filter(r => 
+    r.text.includes('★') || r.text.includes('▲') || r.text.includes('☆') || r.text.includes('△')
+  );
+  const otherRisks = rawRiskCandidates.filter(r => 
+    !r.text.includes('★') && !r.text.includes('▲') && !r.text.includes('☆') && !r.text.includes('△')
+  );
+  
+  // 优先使用 ★/▲ 相关的，再补充其他的
+  const prioritizedRisks = [...starRisks, ...otherRisks].slice(0, maxRisks);
+  console.log(`   ★/▲ 相关候选项: ${starRisks.length} 条`);
+  
+  const riskList = prioritizedRisks.map((r, i) => 
+    `[${i + 1}] 章节「${r.chapterTitle}」: ${r.text.substring(0, maxTextLen)}`
+  ).join('\n');
+  
+  const systemPrompt = `# Role: 资深标书合规审计师 (Senior Bid Compliance Auditor)
 
 ## Core Objective
 你是"防御体系"的构建者。请基于提供的【候选条款列表】(rawRiskCandidates)，输出一份能够直接用于"封标检查"的深度审计报告。
@@ -388,7 +457,8 @@ async function performAIAnalysis(
     "budget": "预算金额或null",
     "location": "开标地点或null",
     "validity": "投标有效期或null",
-    "bond": "保证金或null"
+    "bond": "保证金或null",
+    "biddingMethod": "招标方式（如：公开招标/邀请招标/竞争性谈判/竞争性磋商/单一来源/询价采购）或null"
   },
   "filteredRisks": [
     {
@@ -411,10 +481,10 @@ async function performAIAnalysis(
   }
 }`;
 
-    // 构建章节列表供 AI 识别
-    const chapterList = doc.chapters.map(c => c.title).join('\n- ');
+  // 构建章节列表供 AI 识别
+  const chapterList = doc.chapters.map(c => c.title).join('\n- ');
 
-    const userPrompt = `请分析以下招标文件内容：
+  const userPrompt = `请分析以下招标文件内容：
 
 ## 文档章节列表（请识别各章节类型）
 - ${chapterList}
@@ -430,56 +500,88 @@ ${riskList || '（未发现风险候选条款）'}
 
 请严格按照 JSON 格式返回分析结果，包括 chapterMapping 字段。`;
 
-    // 计算请求大小
-    const requestSize = systemPrompt.length + userPrompt.length;
-    console.log('   请求内容大小:', Math.round(requestSize / 1024), 'KB');
-    console.log('   风险候选项数量:', rawRiskCandidates.length);
-    console.log('   章节数量:', doc.chapters.length);
+  // 计算请求大小
+  const requestSize = systemPrompt.length + userPrompt.length;
+  console.log('   请求内容大小:', Math.round(requestSize / 1024), 'KB');
+  console.log('   风险候选项数量:', rawRiskCandidates.length);
+  console.log('   章节数量:', doc.chapters.length);
+  
+  try {
+    // 检查是否已取消
+    if (signal?.aborted) {
+      console.log('   分析已取消，跳过 AI 请求');
+      return null;
+    }
     
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-lite',
-      contents: userPrompt,
-      config: {
-        systemInstruction: systemPrompt,
+    console.log('   通过后端代理调用 AI...');
+    
+    const response = await fetch(AI_PROXY_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
       },
+      body: JSON.stringify({
+        systemPrompt,
+        userPrompt,
+        maxRetries: 3
+      }),
+      signal  // 传递取消信号
     });
     
-    const responseText = response.text || '';
-    console.log('   AI 原始响应长度:', responseText.length);
+    if (!response.ok) {
+      console.error(`   后端代理返回错误: ${response.status} ${response.statusText}`);
+      return null;
+    }
     
-    // 尝试提取 JSON
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    const result = await response.json();
+    
+    if (!result.success) {
+      console.error(`   AI 分析失败: ${result.error}`);
+      return null;
+    }
+    
+    const responseText = result.text || '';
+    console.log('   AI 原始响应长度:', responseText.length);
+    console.log('   使用模型:', result.model);
+    
+    // 尝试提取 JSON（处理可能的 markdown 代码块）
+    let jsonStr = responseText;
+    
+    // 1. 移除 markdown 代码块标记
+    const codeBlockMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (codeBlockMatch) {
+      jsonStr = codeBlockMatch[1].trim();
+      console.log('   检测到 markdown 代码块，已提取内容');
+    }
+    
+    // 2. 尝试匹配最外层的 JSON 对象
+    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[0]);
         console.log('   AI JSON 解析成功');
+        console.log('   filteredRisks 数量:', parsed.filteredRisks?.length || 0);
         return parsed as AIAnalysisResult;
       } catch (parseError) {
         console.error('   AI JSON 解析失败:', parseError);
-        console.log('   AI 返回内容预览:', responseText.substring(0, 500));
+        console.log('   尝试解析的内容长度:', jsonMatch[0].length);
+        console.log('   AI 返回内容预览:', responseText.substring(0, 800));
         return null;
       }
     }
     
-    console.log('   AI 响应中未找到 JSON，内容预览:', responseText.substring(0, 500));
+    console.log('   AI 响应中未找到 JSON，内容预览:', responseText.substring(0, 800));
     return null;
+    
   } catch (error: any) {
     const errorMsg = error?.message || String(error);
-    console.error('AI Analysis Error:', errorMsg);
+    console.error('AI Analysis Error (via proxy):', errorMsg);
     
-    // 检查是否是网络错误，可以重试
-    const isNetworkError = errorMsg.includes('fetch') || 
-                           errorMsg.includes('network') || 
-                           errorMsg.includes('CONNECTION');
-    
-    if (isNetworkError && retryCount < MAX_RETRIES) {
-      const delay = (retryCount + 1) * 2000;  // 2s, 4s, 6s
-      console.log(`   网络错误，${delay/1000}秒后重试 (${retryCount + 1}/${MAX_RETRIES})...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return performAIAnalysis(doc, rawRiskCandidates, apiKey, retryCount + 1);
+    // 检查是否是后端连接问题
+    if (errorMsg.includes('Failed to fetch') || errorMsg.includes('NetworkError')) {
+      console.error('   ⚠️ 无法连接到后端服务，请确保后端已启动: python backend/main.py');
     }
     
-    console.error('   AI 分析最终失败');
     return null;
   }
 }
@@ -532,7 +634,8 @@ function synthesizeResults(
     budget: createConflictField(regexInfo.budget, aiInfo.budget, 'Regex(全文扫描)', 'AI(智能识别)'),
     location: createConflictField(regexInfo.location, aiInfo.location, 'Regex(全文扫描)', 'AI(智能识别)'),
     validity: createConflictField(regexInfo.validity, aiInfo.validity, 'Regex(全文扫描)', 'AI(智能识别)'),
-    bond: createConflictField(regexInfo.bond, aiInfo.bond, 'Regex(全文扫描)', 'AI(智能识别)')
+    bond: createConflictField(regexInfo.bond, aiInfo.bond, 'Regex(全文扫描)', 'AI(智能识别)'),
+    biddingMethod: createConflictField(regexInfo.biddingMethod, aiInfo.biddingMethod, 'Regex(全文扫描)', 'AI(智能识别)')
   };
   
   // 处理废标风险项
@@ -637,7 +740,10 @@ export async function analyzeBidDocument(
   
   console.log('🤖 Step D: AI 审计分析...');
   checkAborted();
-  const aiResult = await performAIAnalysis(doc, rawRiskCandidates, apiKey);
+  const aiResult = await performAIAnalysis(doc, rawRiskCandidates, apiKey, signal);
+  
+  // 再次检查取消状态（AI 请求可能耗时较长）
+  checkAborted();
   console.log(aiResult ? '   AI 分析成功' : '   AI 分析失败，使用回退方案');
   
   console.log('🔗 Step E: 合成与冲突解决...');
