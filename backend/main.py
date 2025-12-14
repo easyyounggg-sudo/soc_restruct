@@ -1,6 +1,6 @@
 """
-PDF 文档解析后端服务 - V6.0 AI 代理版
-核心改进：两阶段表格提取、伪表格过滤、AI 代理（避免跨域）
+PDF 文档解析后端服务 - V6.1 安全版
+核心改进：两阶段表格提取、伪表格过滤、AI 代理（避免跨域）、环境变量管理密钥
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
@@ -14,14 +14,33 @@ import io
 import os
 import httpx
 import json
+from pathlib import Path
 
-app = FastAPI(title="PDF Parser API", version="6.0.0")
+# 加载环境变量（从项目根目录的 .env 文件）
+from dotenv import load_dotenv
+
+# 尝试从多个位置加载 .env
+env_paths = [
+    Path(__file__).parent.parent / ".env",  # 项目根目录
+    Path(__file__).parent / ".env",          # backend 目录
+]
+for env_path in env_paths:
+    if env_path.exists():
+        load_dotenv(env_path)
+        print(f"[CONFIG] 已加载环境变量: {env_path}")
+        break
+
+app = FastAPI(title="PDF Parser API", version="6.1.0")
 
 # ==================== AI 配置 ====================
 
-# API Key（优先从环境变量读取，否则使用默认值）
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCcdgAV9UQ7qnwAvHkX8GLCAjtaEd5xH8A")
-GEMINI_MODEL = "gemini-2.0-flash-lite"
+# API Key（必须从环境变量读取）
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("[WARNING] 未设置 GEMINI_API_KEY 环境变量！")
+    print("[WARNING] 请在项目根目录创建 .env 文件并添加: GEMINI_API_KEY=your_api_key")
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # CORS 配置
@@ -1093,6 +1112,7 @@ class AIAnalyzeRequest(BaseModel):
     systemPrompt: str
     userPrompt: str
     maxRetries: int = 3
+    apiKey: Optional[str] = None  # 用户输入的 API Key（优先使用）
 
 
 class AIAnalyzeResponse(BaseModel):
@@ -1111,10 +1131,26 @@ async def ai_analyze(request: AIAnalyzeRequest):
     - **systemPrompt**: 系统提示词
     - **userPrompt**: 用户提示词
     - **maxRetries**: 最大重试次数（默认3次）
+    - **apiKey**: 用户输入的 API Key（优先使用）
     """
+    # 优先使用用户提供的 API Key，否则使用环境变量中的
+    active_api_key = request.apiKey or GEMINI_API_KEY
+    
+    # 检查 API Key 是否可用
+    if not active_api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="未提供 API Key。请在页面右上角点击设置图标配置您的 Google Gemini API Key。"
+        )
+    
+    # 日志记录（不泄露完整 Key）
+    key_source = "用户输入" if request.apiKey else "服务器配置"
+    key_preview = f"{active_api_key[:10]}...{active_api_key[-4:]}" if len(active_api_key) > 14 else "***"
+    print(f"[AI] 使用 API Key ({key_source}): {key_preview}")
+    
     headers = {
         "Content-Type": "application/json",
-        "X-goog-api-key": GEMINI_API_KEY
+        "X-goog-api-key": active_api_key
     }
     
     payload = {
