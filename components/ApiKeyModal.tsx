@@ -16,7 +16,10 @@ export const getStoredApiKey = (): string | null => {
     const stored = localStorage.getItem(API_KEY_STORAGE_KEY);
     if (stored) {
       const config: ApiKeyConfig = JSON.parse(stored);
-      return config.apiKey;
+      // 验证 Key 是否有效：非空且以 AIza 开头
+      if (config.apiKey && config.apiKey.trim().length > 0 && config.apiKey.startsWith('AIza')) {
+        return config.apiKey.trim();
+      }
     }
   } catch (e) {
     console.error('Failed to read API key from storage:', e);

@@ -1,23 +1,20 @@
 
 import * as mammoth from 'mammoth';
 import { ParsedDocument, Chapter } from '../types';
-import { extractPdfStructure } from './pdfParser';
 
 /**
  * 统一的文档解析入口
- * 根据文件类型自动选择解析器
+ * 仅支持 .docx 格式
  */
 export async function parseDocument(file: File): Promise<ParsedDocument> {
   const fileName = file.name.toLowerCase();
   
-  if (fileName.endsWith('.pdf')) {
-    return extractPdfStructure(file);
-  } else if (fileName.endsWith('.docx')) {
+  if (fileName.endsWith('.docx')) {
     return extractPerfectStructure(file);
   } else if (fileName.endsWith('.doc')) {
-    throw new Error('不支持旧版 .doc 格式，请将文件另存为 .docx 或转换为 PDF');
+    throw new Error('不支持旧版 .doc 格式，请将文件另存为 .docx');
   } else {
-    throw new Error('不支持的文件格式，请上传 .docx 或 .pdf 文件');
+    throw new Error('不支持的文件格式，请上传 .docx 文件');
   }
 }
 

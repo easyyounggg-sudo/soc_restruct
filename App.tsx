@@ -109,9 +109,13 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Get the active API key (user's key takes priority)
+  // Get the active API key (only from user configuration)
   const getActiveApiKey = (): string | null => {
-    return userApiKey || process.env.API_KEY || null;
+    // 只返回有效的非空字符串 Key
+    if (userApiKey && userApiKey.trim().length > 0 && userApiKey.startsWith('AIza')) {
+      return userApiKey.trim();
+    }
+    return null;
   };
 
   const hasApiKey = !!getActiveApiKey();
@@ -132,12 +136,12 @@ const App: React.FC = () => {
     
     // 检查文件格式
     if (fileName.endsWith('.doc')) {
-      alert('抱歉，不支持旧版 .doc 格式。请将文件另存为 .docx 或转换为 PDF 后再试。');
+      alert('抱歉，不支持旧版 .doc 格式。请将文件另存为 .docx 后再试。');
       return;
     }
     
-    if (!fileName.endsWith('.docx') && !fileName.endsWith('.pdf')) {
-      alert('请上传 .docx 或 .pdf 格式的文件');
+    if (!fileName.endsWith('.docx')) {
+      alert('请上传 .docx 格式的文件');
       return;
     }
 
@@ -237,7 +241,7 @@ const App: React.FC = () => {
       const cached = localStorage.getItem(`analysis_cache_${fingerprint}`);
       if (cached) {
         return JSON.parse(cached);
-      }
+    }
     } catch (e) {
       console.error('Failed to read cache:', e);
     }
@@ -288,12 +292,22 @@ const App: React.FC = () => {
   const handleDeepAnalysis = async (forceRefresh: boolean = false) => {
     if (!doc) return;
     
+    // 如果正在分析中，忽略点击
+    if (analysisState === AnalysisState.ANALYZING) {
+      console.log('正在分析中，忽略重复点击');
+      return;
+    }
+    
     // 如果当前会话已有分析结果，直接显示（不消耗 Token）
     if (keyInfo && !forceRefresh) {
       console.log('已有分析结果，直接显示');
+      // 确保清除任何可能的分析中状态
+      abortControllerRef.current = null;
       // 确保状态为 COMPLETED，然后显示面板
       setAnalysisState(AnalysisState.COMPLETED);
       setShowAnalysisPanel(true);
+      // 重置风险定位状态
+      setLocatingRisk(null);
       return;
     }
     
@@ -398,18 +412,46 @@ const App: React.FC = () => {
       return;
     }
     
-    // 查找包含该风险文本的章节
-    const targetChapter = doc.chapters.find(c => {
-      // 先按章节标题匹配
-      if (c.title.includes(risk.chapterTitle.replace(/第[一二三四五六七八九十\d]+[章节篇部]\s*/, ''))) {
-        return true;
+    // 提取搜索关键词（取风险文本中的核心部分）
+    const getSearchKeywords = (text: string): string[] => {
+      // 清理文本，取多个片段用于匹配
+      const cleanText = text.replace(/[★▲☆△※\*]/g, '').trim();
+      const keywords: string[] = [];
+      
+      // 取前20个字符
+      if (cleanText.length >= 10) {
+        keywords.push(cleanText.substring(0, 20));
       }
-      // 如果标题不匹配，检查内容是否包含风险文本
+      // 取中间部分
+      if (cleanText.length >= 30) {
+        keywords.push(cleanText.substring(10, 30));
+      }
+      // 完整文本（用于精确匹配）
+      if (cleanText.length <= 50) {
+        keywords.push(cleanText);
+      }
+      
+      return keywords.filter(k => k.length >= 5);
+    };
+    
+    const searchKeywords = getSearchKeywords(risk.text);
+    
+    // 查找包含该风险文本的章节
+    let targetChapter = doc.chapters.find(c => {
       const plainContent = c.content.replace(/<[^>]*>/g, '');
-      // 取风险文本的前30个字符进行模糊匹配
-      const searchText = risk.text.substring(0, 30);
-      return plainContent.includes(searchText);
+      // 任意一个关键词匹配即可
+      return searchKeywords.some(keyword => plainContent.includes(keyword));
     });
+    
+    // 如果内容匹配失败，尝试按章节标题匹配
+    if (!targetChapter) {
+      const titleKeyword = risk.chapterTitle.replace(/第[一二三四五六七八九十\d]+[章节篇部]\s*/, '').trim();
+      if (titleKeyword) {
+        targetChapter = doc.chapters.find(c => 
+          c.title.includes(titleKeyword) || titleKeyword.includes(c.title.replace(/第[一二三四五六七八九十\d]+[章节篇部]\s*/, ''))
+        );
+      }
+    }
     
     if (targetChapter) {
       // 切换到该章节
@@ -423,9 +465,11 @@ const App: React.FC = () => {
         if (highlightEl) {
           highlightEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
-      }, 100);
+      }, 150);
     } else {
-      // 未找到章节，仍然设置定位状态（会在当前章节尝试高亮）
+      // 未找到章节，提示用户
+      console.warn('未能定位到章节:', risk.chapterTitle);
+      // 仍然设置定位状态（会在当前章节尝试高亮）
       setLocatingRisk(risk);
     }
   }, [doc, locatingRisk]);
@@ -434,15 +478,42 @@ const App: React.FC = () => {
   const highlightRiskText = useCallback((html: string): string => {
     if (!locatingRisk) return html;
     
-    // 取风险文本的前50个字符进行匹配（避免过长导致匹配失败）
-    const searchText = locatingRisk.text.substring(0, 50).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // 清理风险文本，移除特殊符号
+    const cleanText = locatingRisk.text.replace(/[★▲☆△※\*]/g, '').trim();
     
-    try {
-      const regex = new RegExp(`(${searchText})`, 'gi');
-      return html.replace(regex, '<mark class="risk-highlight bg-red-200 text-red-900 px-1 rounded animate-pulse">$1</mark>');
-    } catch {
-      return html;
+    // 尝试多个长度的匹配（从长到短）
+    const tryLengths = [60, 40, 25, 15];
+    
+    for (const len of tryLengths) {
+      if (cleanText.length < len) continue;
+      
+      const searchText = cleanText.substring(0, len).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      
+      try {
+        const regex = new RegExp(`(${searchText})`, 'gi');
+        if (regex.test(html)) {
+          return html.replace(regex, '<mark class="risk-highlight bg-red-200 text-red-900 px-1 rounded animate-pulse">$1</mark>');
+        }
+      } catch {
+        continue;
+      }
     }
+    
+    // 如果上述都匹配失败，尝试匹配任意包含的关键词
+    const keywords = cleanText.split(/[，。、；：\s]+/).filter(k => k.length >= 4).slice(0, 3);
+    for (const keyword of keywords) {
+      const escapedKeyword = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      try {
+        const regex = new RegExp(`(${escapedKeyword})`, 'gi');
+        if (regex.test(html)) {
+          return html.replace(regex, '<mark class="risk-highlight bg-yellow-200 text-yellow-900 px-1 rounded">$1</mark>');
+        }
+      } catch {
+        continue;
+      }
+    }
+    
+    return html;
   }, [locatingRisk]);
   
   // 搜索支持：标题 + 内容
@@ -596,15 +667,15 @@ const App: React.FC = () => {
             {filteredChapters.map((chapter) => {
               const matchInfo = getMatchInfo(chapter);
               return (
-                <button
-                  key={chapter.id}
-                  onClick={() => setActiveChapterId(chapter.id)}
-                  className={`w-full text-left px-4 py-3 rounded-xl transition-all flex items-center justify-between group ${
-                    activeChapterId === chapter.id 
-                      ? 'bg-blue-50 text-blue-700 shadow-sm border border-blue-100' 
-                      : 'hover:bg-slate-50 text-slate-600'
-                  }`}
-                >
+              <button
+                key={chapter.id}
+                onClick={() => setActiveChapterId(chapter.id)}
+                className={`w-full text-left px-4 py-3 rounded-xl transition-all flex items-center justify-between group ${
+                  activeChapterId === chapter.id 
+                    ? 'bg-blue-50 text-blue-700 shadow-sm border border-blue-100' 
+                    : 'hover:bg-slate-50 text-slate-600'
+                }`}
+              >
                   <div className="flex-1 min-w-0">
                     {/* 标题 - 高亮搜索词 */}
                     <span 
@@ -628,7 +699,7 @@ const App: React.FC = () => {
                     )}
                   </div>
                   {activeChapterId === chapter.id && <ChevronRight size={16} className="shrink-0 ml-2" />}
-                </button>
+              </button>
               );
             })}
             {filteredChapters.length === 0 && (
@@ -735,12 +806,12 @@ const App: React.FC = () => {
                   上传招标文件
                   <input 
                     type="file" 
-                    accept=".docx,.pdf" 
+                    accept=".docx" 
                     className="hidden" 
                     onChange={handleFileUpload} 
                   />
                 </label>
-                <span className="text-[10px] text-slate-400 mt-1 mr-1">支持 .docx / .pdf 格式</span>
+                <span className="text-[10px] text-slate-400 mt-1 mr-1">支持 .docx 格式</span>
               </div>
             )}
           </div>
@@ -755,12 +826,12 @@ const App: React.FC = () => {
               </div>
               <h2 className="text-3xl font-bold text-slate-800 mb-4">开始结构化解析</h2>
               <p className="text-slate-500 mb-6 leading-relaxed text-lg">
-                上传您的招标文件 (<b>.docx</b> 或 <b>.pdf</b>)，系统将自动过滤目录干扰、智能提取章节结构，并高亮标注填空项。
+                上传您的招标文件 (<b>.docx</b>)，系统将自动过滤目录干扰、智能提取章节结构，并高亮标注填空项。
               </p>
               
               <div className="flex items-center gap-2 px-4 py-2 bg-blue-50 border border-blue-100 rounded-xl text-blue-800 text-sm mb-10">
                 <Info size={18} className="shrink-0" />
-                <span><b>支持格式：</b> .docx（推荐）、.pdf | 不支持旧版 .doc 格式</span>
+                <span><b>支持格式：</b> .docx | 不支持旧版 .doc 格式</span>
               </div>
 
               <div className="grid grid-cols-2 gap-4 w-full text-left">
@@ -796,7 +867,7 @@ const App: React.FC = () => {
             </div>
           )}
 
-          {state === AppState.VIEWING && showAnalysisPanel && keyInfo && !locatingRisk && (
+          {state === AppState.VIEWING && showAnalysisPanel && keyInfo && !locatingRisk && analysisState === AnalysisState.COMPLETED && (
             <div className="max-w-5xl mx-auto">
               <AnalysisDashboard
                 keyInfo={keyInfo}
@@ -810,7 +881,7 @@ const App: React.FC = () => {
           )}
 
           {/* 风险定位模式：左右分栏布局 */}
-          {state === AppState.VIEWING && showAnalysisPanel && keyInfo && locatingRisk && activeChapter && (
+          {state === AppState.VIEWING && showAnalysisPanel && keyInfo && locatingRisk && activeChapter && analysisState === AnalysisState.COMPLETED && (
             <div className="flex gap-4 h-full">
               {/* 左侧：原文内容 */}
               <div className="flex-1 bg-white border border-slate-100 rounded-2xl shadow-sm p-6 overflow-auto" ref={contentRef}>
@@ -864,9 +935,9 @@ const App: React.FC = () => {
               <div className="mb-8 pb-4 border-b border-slate-100">
                 <div className="flex items-center justify-between">
                   <div>
-                    <span className="inline-block px-3 py-1 bg-blue-100 text-blue-700 rounded-lg text-xs font-bold uppercase tracking-wider mb-2">
-                      当前章节
-                    </span>
+                <span className="inline-block px-3 py-1 bg-blue-100 text-blue-700 rounded-lg text-xs font-bold uppercase tracking-wider mb-2">
+                  当前章节
+                </span>
                     <h2 
                       className="text-3xl font-bold text-slate-900"
                       dangerouslySetInnerHTML={{ 
@@ -977,8 +1048,8 @@ const App: React.FC = () => {
                 </div>
                 {msg.role === 'user' ? (
                   <div className="max-w-[80%] p-3 rounded-2xl rounded-tr-none text-sm shadow-sm bg-blue-600 text-white">
-                    {msg.text}
-                  </div>
+                  {msg.text}
+                </div>
                 ) : (
                   <div 
                     className="max-w-[85%] p-4 rounded-2xl rounded-tl-none text-sm shadow-sm bg-white text-slate-800 border border-slate-100 prose prose-sm prose-slate"
@@ -1062,19 +1133,27 @@ const ConflictFieldDisplay: React.FC<{
           {expanded && (
             <div className="mt-2 space-y-2">
               {field.candidates.map((c, i) => (
-                <label key={i} className="flex items-center gap-2 p-2 bg-white rounded-lg border border-amber-200 cursor-pointer hover:bg-amber-50">
-                  <input
-                    type="radio"
-                    name={fieldKey}
-                    checked={field.value === c.value}
-                    onChange={() => onResolve(fieldKey, c.value)}
-                    className="text-amber-600"
-                  />
+                <button
+                  key={i}
+                  onClick={() => onResolve(fieldKey, c.value)}
+                  className={`w-full flex items-center gap-2 p-2 rounded-lg border transition-colors text-left ${
+                    field.value === c.value 
+                      ? 'border-green-300 bg-green-50 ring-1 ring-green-200' 
+                      : 'border-amber-200 bg-white hover:bg-amber-50'
+                  }`}
+                >
+                  <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
+                    field.value === c.value ? 'border-green-500 bg-green-500' : 'border-slate-300'
+                  }`}>
+                    {field.value === c.value && (
+                      <div className="w-2 h-2 rounded-full bg-white"></div>
+                    )}
+                  </div>
                   <div className="flex-1">
                     <div className="text-sm font-medium text-slate-800">{c.value}</div>
                     <div className="text-xs text-slate-500">{c.source}</div>
                   </div>
-                </label>
+                </button>
               ))}
             </div>
           )}

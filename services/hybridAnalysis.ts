@@ -126,6 +126,60 @@ function extractBasicInfoByRegex(rawHtml: string): RegexInfo {
     return null;
   };
   
+  // 组织机构专用提取：智能识别组织名称边界
+  const extractOrganization = (patterns: RegExp[]): string | null => {
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match && match[1]) {
+        let value = match[1].trim();
+        
+        // 策略1：在遇到这些关键词时截断
+        const stopKeywords = [
+          '地址', '联系人', '电话', '传真', '邮编', '邮箱', 
+          '网址', '账号', '开户', '账户', '法定代表人',
+          '联系方式', '通讯地址', '办公地址', '负责人',
+          '项目经理', '技术负责', '售后'
+        ];
+        
+        for (const keyword of stopKeywords) {
+          const idx = value.indexOf(keyword);
+          if (idx > 0) {
+            value = value.substring(0, idx).trim();
+          }
+        }
+        
+        // 策略2：查找组织名称的典型结尾词，在其后截断
+        const orgSuffixes = [
+          '有限公司', '股份公司', '有限责任公司', '集团公司',
+          '公司', '集团', '中心', '研究院', '研究所', '事务所',
+          '管理局', '管理处', '管理中心', '服务中心',
+          '委员会', '办公室', '局', '院', '所', '站', '队', '部'
+        ];
+        
+        for (const suffix of orgSuffixes) {
+          const idx = value.indexOf(suffix);
+          if (idx > 0) {
+            // 在结尾词之后截断
+            const cutPoint = idx + suffix.length;
+            if (cutPoint < value.length) {
+              value = value.substring(0, cutPoint);
+            }
+            break;  // 只匹配第一个找到的结尾词
+          }
+        }
+        
+        // 去除尾部可能的冗余字符
+        value = value.replace(/[：:,，\s]+$/, '');
+        
+        // 验证：长度合理
+        if (value.length >= 4 && value.length <= 50) {
+          return value;
+        }
+      }
+    }
+    return null;
+  };
+  
   // 智能提取：遇到常见字段名或特殊符号时停止
   const extractUntilNextField = (patterns: RegExp[]): string | null => {
     for (const pattern of patterns) {
@@ -171,19 +225,19 @@ function extractBasicInfoByRegex(rawHtml: string): RegexInfo {
       /招标编号[：:]\s*([A-Za-z0-9\-_]+(?:\s*[\-_]\s*[A-Za-z0-9]+)*)/
     ]),
     
-    // 采购人（限制长度，排除常见干扰词）
-    purchaser: extract([
-      /采购人[（\(]?甲方[）\)]?[：:]\s*([^，。\n（\(]{2,40})/,
-      /采购人[：:]\s*([^，。\n（\(]{2,40})/,
-      /招标人[：:]\s*([^，。\n（\(]{2,40})/,
-      /业主单位[：:]\s*([^，。\n（\(]{2,40})/
+    // 采购人（智能提取，遇到地址/联系人等时停止）
+    purchaser: extractOrganization([
+      /采购人[（\(]?甲方[）\)]?[：:]\s*([^，。\n]{2,80})/,
+      /采购人[：:]\s*([^，。\n]{2,80})/,
+      /招标人[：:]\s*([^，。\n]{2,80})/,
+      /业主单位[：:]\s*([^，。\n]{2,80})/
     ]),
     
-    // 代理机构
-    agency: extract([
-      /代理机构[：:]\s*([^，。\n]{2,60})/,
-      /招标代理[：:]\s*([^，。\n]{2,60})/,
-      /采购代理[机构]*[：:]\s*([^，。\n]{2,60})/
+    // 代理机构（智能提取，遇到地址/联系人等时停止）
+    agency: extractOrganization([
+      /代理机构[：:]\s*([^，。\n]{2,80})/,
+      /招标代理[：:]\s*([^，。\n]{2,80})/,
+      /采购代理[机构]*[：:]\s*([^，。\n]{2,80})/
     ]),
     
     // 投标截止时间
@@ -371,7 +425,7 @@ interface AIAnalysisResult {
 async function performAIAnalysis(
   doc: ParsedDocument,
   rawRiskCandidates: RawRiskCandidate[],
-  _apiKey: string,  // 不再使用，API Key 在后端
+  apiKey: string,  // 用户输入的 API Key，传递给后端
   signal?: AbortSignal  // 用于取消请求
 ): Promise<AIAnalysisResult | null> {
   
@@ -523,7 +577,8 @@ ${riskList || '（未发现风险候选条款）'}
       body: JSON.stringify({
         systemPrompt,
         userPrompt,
-        maxRetries: 3
+        maxRetries: 3,
+        apiKey: apiKey || undefined  // 传递用户输入的 API Key（如果有）
       }),
       signal  // 传递取消信号
     });
