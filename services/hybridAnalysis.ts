@@ -113,8 +113,122 @@ interface RegexInfo {
 }
 
 function extractBasicInfoByRegex(rawHtml: string): RegexInfo {
-  // 移除 HTML 标签
+  // 移除 HTML 标签（普通文本提取）
   const text = rawHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+  
+  // ========== 表格数据提取 ==========
+  // 专门处理 HTML 表格中的键值对数据（支持按行列结构）
+  const extractFromTable = (labelPatterns: RegExp[], unitHint?: string): string | null => {
+    // 匹配所有表格
+    const tableMatches = rawHtml.matchAll(/<table[^>]*>([\s\S]*?)<\/table>/gi);
+    
+    for (const tableMatch of tableMatches) {
+      const tableHtml = tableMatch[1];
+      
+      // 提取所有行
+      const rows: string[][] = [];
+      const rowMatches = tableHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
+      for (const rowMatch of rowMatches) {
+        const rowHtml = rowMatch[1];
+        const cells: string[] = [];
+        const cellMatches = rowHtml.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi);
+        for (const cellMatch of cellMatches) {
+          const cellText = cellMatch[1].replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+          cells.push(cellText);
+        }
+        if (cells.length > 0) {
+          rows.push(cells);
+        }
+      }
+      
+      if (rows.length < 2) continue; // 至少需要表头行和数据行
+      
+      // 策略1：表头在第一行，数据在后续行（按列匹配）
+      const headerRow = rows[0];
+      for (let colIdx = 0; colIdx < headerRow.length; colIdx++) {
+        const headerCell = headerRow[colIdx];
+        for (const pattern of labelPatterns) {
+          if (pattern.test(headerCell)) {
+            // 找到匹配的列，查找该列的数据
+            for (let rowIdx = 1; rowIdx < rows.length; rowIdx++) {
+              const dataRow = rows[rowIdx];
+              if (colIdx < dataRow.length) {
+                const dataCell = dataRow[colIdx];
+                // 检查是否是有效数值（排除空值、斜杠等）
+                const numMatch = dataCell.match(/^[\d,，.]+$/);
+                if (numMatch && dataCell !== '0' && dataCell !== '') {
+                  let value = dataCell;
+                  // 如果表头包含单位提示，添加单位
+                  if (headerCell.includes('万元') || unitHint === '万元') {
+                    value = value + '万元';
+                  } else if (headerCell.includes('元')) {
+                    value = value + '元';
+                  }
+                  console.log(`[表格提取-列匹配] 找到匹配:`);
+                  console.log(`   表头: "${headerCell}" (列${colIdx})`);
+                  console.log(`   数值: "${value}" (行${rowIdx})`);
+                  return value;
+                }
+              }
+            }
+          }
+        }
+      }
+      
+      // 策略2：键值对在同一行（标签在前，数值在后）
+      for (const row of rows) {
+        for (let i = 0; i < row.length; i++) {
+          const cell = row[i];
+          for (const pattern of labelPatterns) {
+            if (pattern.test(cell)) {
+              // 查找同一行后续的数值
+              for (let j = i + 1; j < row.length; j++) {
+                const nextCell = row[j];
+                const numMatch = nextCell.match(/^[\d,，.]+\s*(万?元?)?$/);
+                if (numMatch && nextCell !== '' && nextCell !== '\\' && nextCell !== '/') {
+                  let value = nextCell;
+                  if (cell.includes('万元') || unitHint === '万元') {
+                    if (!value.includes('元') && !value.includes('万')) {
+                      value = value + '万元';
+                    }
+                  }
+                  console.log(`[表格提取-行匹配] 找到匹配:`);
+                  console.log(`   标签: "${cell}"`);
+                  console.log(`   数值: "${value}"`);
+                  return value;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return null;
+  };
+  
+  // 带调试日志的提取函数
+  const extractWithDebug = (fieldName: string, patterns: RegExp[]): string | null => {
+    for (let i = 0; i < patterns.length; i++) {
+      const pattern = patterns[i];
+      const match = text.match(pattern);
+      if (match && match[1]) {
+        const value = match[1].trim();
+        console.log(`[Regex] ${fieldName} 匹配成功:`);
+        console.log(`   模式 #${i + 1}: ${pattern.toString().substring(0, 60)}...`);
+        console.log(`   匹配值: "${value}"`);
+        // 显示匹配位置附近的上下文
+        const matchIndex = text.indexOf(match[0]);
+        if (matchIndex !== -1) {
+          const contextStart = Math.max(0, matchIndex - 30);
+          const contextEnd = Math.min(text.length, matchIndex + match[0].length + 30);
+          console.log(`   上下文: "...${text.substring(contextStart, contextEnd)}..."`);
+        }
+        return value;
+      }
+    }
+    console.log(`[Regex] ${fieldName} 未匹配到任何结果`);
+    return null;
+  };
   
   const extract = (patterns: RegExp[]): string | null => {
     for (const pattern of patterns) {
@@ -248,14 +362,23 @@ function extractBasicInfoByRegex(rawHtml: string): RegexInfo {
       /(\d{4}[\-\/年]\d{1,2}[\-\/月]\d{1,2}日?\s*\d{1,2}[：:]\d{2})/
     ]),
     
-    // 预算金额（处理万元、元等单位）
-    budget: extract([
-      /预算金额[：:]\s*([\d,，.]+\s*万?元)/,
-      /最高限价[：:]\s*([\d,，.]+\s*万?元)/,
-      /采购预算[：:]\s*([\d,，.]+\s*万?元)/,
-      /项目预算[：:]\s*([\d,，.]+\s*万?元)/,
-      /控制价[：:]\s*([\d,，.]+\s*万?元)/
-    ]),
+    // 预算金额（处理万元、元等单位）- 同时搜索表格和普通文本
+    budget: (() => {
+      const fromTable = extractFromTable([/预算/, /最高限价/, /控制价/, /采购金额/], '万元');
+      const fromText = extractWithDebug('预算金额', [
+        /预算金额[：:]\s*([\d,，.]+\s*万?元)/,
+        /最高限价[：:]\s*([\d,，.]+\s*万?元)/,
+        /采购预算[（\(]?万?元?[）\)]?[：:]\s*([\d,，.]+\s*万?元?)/,
+        /项目预算[：:]\s*([\d,，.]+\s*万?元)/,
+        /控制价[：:]\s*([\d,，.]+\s*万?元)/
+      ]);
+      // 优先使用更具体的值（带单位的）
+      if (fromTable && fromText) {
+        console.log(`[预算金额] 表格: "${fromTable}", 文本: "${fromText}"`);
+        return fromTable.includes('元') ? fromTable : (fromText.includes('元') ? fromText : fromTable);
+      }
+      return fromTable || fromText;
+    })(),
     
     // 开标地点
     location: extract([
@@ -271,19 +394,36 @@ function extractBasicInfoByRegex(rawHtml: string): RegexInfo {
       /有效期[：:]\s*([\d]+\s*[天日个月年]+)/
     ]),
     
-    // 保证金
-    bond: extract([
-      /投标保证金[：:]\s*([\d,，.]+\s*万?元)/,
-      /保证金金额[：:]\s*([\d,，.]+\s*万?元)/,
-      /保证金[：:]\s*([\d,，.]+\s*万?元|不[需要求提交]+|免[收交缴]+)/
-    ]),
+    // 保证金 - 同时搜索表格和普通文本
+    bond: (() => {
+      const fromTable = extractFromTable([/投标保证金/, /保证金/], '万元');
+      const fromText = extractWithDebug('保证金', [
+        /投标保证金[：:]\s*([\d,，.]+\s*万?元)/,
+        /保证金金额[：:]\s*([\d,，.]+\s*万?元)/,
+        /保证金[：:]\s*([\d,，.]+\s*万?元)/,
+        /保证金[：:]\s*(不[需要求提交]+|免[收交缴]+|无)/
+      ]);
+      // 优先使用数值结果
+      if (fromTable && fromText) {
+        console.log(`[保证金] 表格: "${fromTable}", 文本: "${fromText}"`);
+        // 如果表格有数值，优先使用表格；如果文本是"详见xxx"之类，用表格
+        const tableHasNumber = /[\d]/.test(fromTable);
+        const textHasNumber = /[\d]/.test(fromText);
+        if (tableHasNumber && !textHasNumber) return fromTable;
+        if (!tableHasNumber && textHasNumber) return fromText;
+        return fromTable; // 都有数值时优先表格
+      }
+      return fromTable || fromText;
+    })(),
     
-    // 招标方式（新增）
+    // 招标方式（新增）- 增强匹配规则
     biddingMethod: extract([
-      /采购方式[：:]\s*(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源|询价采购|框架协议)/,
-      /招标方式[：:]\s*(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源|询价采购|框架协议)/,
-      /本项目采用\s*(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源|询价采购)/,
-      /(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源采购|询价采购)[方式]*进行采购/
+      /采购方式[：:]\s*(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源采?购?|询价采购|框架协议|邀标|比选|比价)/,
+      /招标方式[：:]\s*(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源采?购?|询价采购|框架协议|邀标|比选|比价)/,
+      /本项目采用\s*(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源采?购?|询价采购|比选|比价)/,
+      /(公开招标|邀请招标|竞争性谈判|竞争性磋商|单一来源采购|询价采购|比选|比价)[方式]*进行[采购招标]*/,
+      /采购组织形式[：:]\s*(集中采购|分散采购|自行采购|委托采购)/,
+      /项目类型[：:]\s*(货物类?|服务类?|工程类?)/
     ])
   };
 }
@@ -429,22 +569,98 @@ async function performAIAnalysis(
   signal?: AbortSignal  // 用于取消请求
 ): Promise<AIAnalysisResult | null> {
   
-  // 获取招标公告和投标须知章节的内容
+  // 获取招标公告、投标邀请和投标须知章节的内容
   const noticeChapter = doc.chapters.find(c => 
     CHAPTER_KEYWORDS.notice.some(kw => c.title.includes(kw))
   );
   const instructionsChapter = doc.chapters.find(c => 
     CHAPTER_KEYWORDS.instructions.some(kw => c.title.includes(kw))
   );
+  // 新增：投标邀请章节（通常包含招标方式、预算等基本信息）
+  const invitationChapter = doc.chapters.find(c => 
+    c.title.includes('投标邀请') || c.title.includes('招标邀请') || c.title.includes('采购邀请') ||
+    c.title.includes('邀请函') || c.title.includes('邀请书')
+  );
+  
+  // ========== 表格提取为 JSON ==========
+  const extractTablesAsJson = (html: string): string => {
+    const tables: Array<{ headers: string[]; rows: string[][] }> = [];
+    const tableMatches = html.matchAll(/<table[^>]*>([\s\S]*?)<\/table>/gi);
+    
+    for (const tableMatch of tableMatches) {
+      const tableHtml = tableMatch[1];
+      const rows: string[][] = [];
+      const rowMatches = tableHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
+      
+      for (const rowMatch of rowMatches) {
+        const rowHtml = rowMatch[1];
+        const cells: string[] = [];
+        const cellMatches = rowHtml.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi);
+        for (const cellMatch of cellMatches) {
+          const cellText = cellMatch[1].replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+          cells.push(cellText);
+        }
+        if (cells.length > 0) {
+          rows.push(cells);
+        }
+      }
+      
+      if (rows.length >= 2) {
+        // 第一行作为表头
+        tables.push({
+          headers: rows[0],
+          rows: rows.slice(1)
+        });
+      }
+    }
+    
+    if (tables.length === 0) return '';
+    
+    // 转换为易读的 JSON 格式
+    return JSON.stringify(tables, null, 2);
+  };
+  
+  // 从 HTML 中提取纯文本（排除表格内容，避免重复）
+  const extractTextWithoutTables = (html: string): string => {
+    // 先移除表格
+    const withoutTables = html.replace(/<table[^>]*>[\s\S]*?<\/table>/gi, ' [表格内容见下方JSON] ');
+    // 再移除其他 HTML 标签
+    return withoutTables.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  };
   
   // 限制内容大小，避免请求过大
-  const maxContentLength = 6000;
+  const maxContentLength = 4000;
+  const maxTableJsonLength = 2000;
+  
+  // 提取各章节的文本和表格
   const noticeText = noticeChapter 
-    ? noticeChapter.content.replace(/<[^>]*>/g, '').substring(0, maxContentLength)
+    ? extractTextWithoutTables(noticeChapter.content).substring(0, maxContentLength)
     : '';
+  const noticeTablesJson = noticeChapter 
+    ? extractTablesAsJson(noticeChapter.content).substring(0, maxTableJsonLength)
+    : '';
+    
   const instructionsText = instructionsChapter 
-    ? instructionsChapter.content.replace(/<[^>]*>/g, '').substring(0, maxContentLength)
+    ? extractTextWithoutTables(instructionsChapter.content).substring(0, maxContentLength)
     : '';
+  const instructionsTablesJson = instructionsChapter 
+    ? extractTablesAsJson(instructionsChapter.content).substring(0, maxTableJsonLength)
+    : '';
+    
+  const invitationText = invitationChapter 
+    ? extractTextWithoutTables(invitationChapter.content).substring(0, maxContentLength)
+    : '';
+  const invitationTablesJson = invitationChapter 
+    ? extractTablesAsJson(invitationChapter.content).substring(0, maxTableJsonLength)
+    : '';
+  
+  // 日志：显示提取的表格
+  if (invitationTablesJson) {
+    console.log('[AI输入] 投标邀请章节表格JSON:', invitationTablesJson.substring(0, 500) + '...');
+  }
+  if (noticeTablesJson) {
+    console.log('[AI输入] 招标公告章节表格JSON:', noticeTablesJson.substring(0, 500) + '...');
+  }
   
   // 构建风险候选项列表（优先 ★/▲ 相关的条款）
   const maxRisks = 80;
@@ -499,19 +715,25 @@ async function performAIAnalysis(
 - **scoring**: 评分标准/评标办法/评审办法等章节
 - **format**: 投标文件格式/响应文件格式等章节
 
+## ⚠️ 基本信息提取规则（Critical）:
+- **只提取明确出现在文本中的数值**，禁止推断或编造
+- 如果某字段在文本中未明确出现具体数值，必须返回 null
+- 例如：如果看到"预算详见xxx"而没有具体金额，定位到xxx位置并读取数值，如未查询到则返回 null
+- 例如：如果看到"保证金详见本篇"而没有具体金额，返回 null
+
 ## Output Format (JSON Only):
 必须返回严格的 JSON 格式（不要有任何其他文字）：
 {
   "basicInfo": {
-    "projectName": "项目名称或null",
-    "projectCode": "项目编号或null",
+    "projectName": "项目名称或null（必须是明确的名称）",
+    "projectCode": "项目编号或null（必须是明确的编号）",
     "purchaser": "采购人或null",
     "agency": "代理机构或null",
-    "deadline": "投标截止时间或null",
-    "budget": "预算金额或null",
+    "deadline": "投标截止时间或null（必须是明确的日期时间）",
+    "budget": "预算金额或null（必须是明确的数字+单位，如'91万元'，禁止编造）",
     "location": "开标地点或null",
     "validity": "投标有效期或null",
-    "bond": "保证金或null",
+    "bond": "保证金或null（必须是明确的数字+单位，如'9万元'，禁止编造）",
     "biddingMethod": "招标方式（如：公开招标/邀请招标/竞争性谈判/竞争性磋商/单一来源/询价采购）或null"
   },
   "filteredRisks": [
@@ -543,16 +765,29 @@ async function performAIAnalysis(
 ## 文档章节列表（请识别各章节类型）
 - ${chapterList}
 
+## 投标邀请内容（包含招标方式、预算等基本信息）
+### 文本内容：
+${invitationText || '（未找到投标邀请章节）'}
+${invitationTablesJson ? `### 表格数据（JSON格式，headers为表头，rows为数据行）：
+${invitationTablesJson}` : ''}
+
 ## 招标公告内容
+### 文本内容：
 ${noticeText || '（未找到招标公告章节）'}
+${noticeTablesJson ? `### 表格数据（JSON格式）：
+${noticeTablesJson}` : ''}
 
 ## 投标人须知内容
+### 文本内容：
 ${instructionsText || '（未找到投标须知章节）'}
+${instructionsTablesJson ? `### 表格数据（JSON格式）：
+${instructionsTablesJson}` : ''}
 
 ## 风险候选条款（请过滤并分析）
 ${riskList || '（未发现风险候选条款）'}
 
-请严格按照 JSON 格式返回分析结果，包括 chapterMapping 字段。`;
+请严格按照 JSON 格式返回分析结果，包括 chapterMapping 字段。
+⚠️ 重要：基本信息中的数值字段（预算、保证金等）请从上方表格JSON中精确读取，表头标明了字段名，对应行的数据就是值。`;
 
   // 计算请求大小
   const requestSize = systemPrompt.length + userPrompt.length;
@@ -609,17 +844,55 @@ ${riskList || '（未发现风险候选条款）'}
       console.log('   检测到 markdown 代码块，已提取内容');
     }
     
-    // 2. 尝试匹配最外层的 JSON 对象
+    // 2. 清理 JSON 字符串中的无效控制字符
+    const cleanJsonString = (str: string): string => {
+      // 第一步：移除所有控制字符（0x00-0x1F），除了 \n \r \t
+      let cleaned = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+      
+      // 第二步：处理字符串内部的换行符（在 JSON 字符串值中，换行需要转义）
+      // 找到所有在引号内的未转义换行符并转义它们
+      cleaned = cleaned.replace(/"([^"\\]|\\.)*"/g, (match) => {
+        // 在字符串值内部，将真实的换行符替换为 \\n
+        return match
+          .replace(/\r\n/g, '\\n')
+          .replace(/\r/g, '\\n')
+          .replace(/\n/g, '\\n')
+          .replace(/\t/g, '\\t');
+      });
+      
+      return cleaned;
+    };
+    
+    // 3. 尝试匹配最外层的 JSON 对象
     const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       try {
-        const parsed = JSON.parse(jsonMatch[0]);
+        // 清理控制字符后再解析
+        const cleanedJson = cleanJsonString(jsonMatch[0]);
+        const parsed = JSON.parse(cleanedJson);
         console.log('   AI JSON 解析成功');
         console.log('   filteredRisks 数量:', parsed.filteredRisks?.length || 0);
+        // 打印 AI 返回的 basicInfo 详情
+        if (parsed.basicInfo) {
+          console.log('   AI basicInfo 详情:');
+          console.log(`      预算(budget): "${parsed.basicInfo.budget}"`);
+          console.log(`      保证金(bond): "${parsed.basicInfo.bond}"`);
+          console.log(`      招标方式(biddingMethod): "${parsed.basicInfo.biddingMethod}"`);
+        }
         return parsed as AIAnalysisResult;
       } catch (parseError) {
         console.error('   AI JSON 解析失败:', parseError);
         console.log('   尝试解析的内容长度:', jsonMatch[0].length);
+        // 尝试找到问题位置
+        if (parseError instanceof SyntaxError && parseError.message.includes('position')) {
+          const posMatch = parseError.message.match(/position (\d+)/);
+          if (posMatch) {
+            const pos = parseInt(posMatch[1]);
+            const start = Math.max(0, pos - 50);
+            const end = Math.min(jsonMatch[0].length, pos + 50);
+            console.log('   问题位置附近的内容:', jsonMatch[0].substring(start, end));
+          }
+        }
         console.log('   AI 返回内容预览:', responseText.substring(0, 800));
         return null;
       }
@@ -651,21 +924,37 @@ function createConflictField(
 ): ConflictField {
   const candidates: Array<{ value: string; source: string }> = [];
   
-  if (regexValue) {
-    candidates.push({ value: regexValue, source: regexSource });
+  // 过滤掉字符串 "null" 或空白字符串
+  const cleanValue = (v: string | null | undefined): string | null => {
+    if (!v) return null;
+    const trimmed = v.trim();
+    if (trimmed === '' || trimmed.toLowerCase() === 'null' || trimmed === '无' || trimmed === '暂无') {
+      return null;
+    }
+    return trimmed;
+  };
+  
+  const cleanRegex = cleanValue(regexValue);
+  const cleanAI = cleanValue(aiValue);
+  
+  if (cleanRegex) {
+    candidates.push({ value: cleanRegex, source: regexSource });
   }
-  if (aiValue && aiValue !== regexValue) {
-    candidates.push({ value: aiValue, source: aiSource });
+  if (cleanAI && cleanAI !== cleanRegex) {
+    candidates.push({ value: cleanAI, source: aiSource });
   }
   
   // 标准化比较
-  const normalizedRegex = regexValue?.replace(/\s+/g, '').toLowerCase() || '';
-  const normalizedAI = aiValue?.replace(/\s+/g, '').toLowerCase() || '';
+  const normalizedRegex = cleanRegex?.replace(/\s+/g, '').toLowerCase() || '';
+  const normalizedAI = cleanAI?.replace(/\s+/g, '').toLowerCase() || '';
   
-  const isConflict = !!(regexValue && aiValue && normalizedRegex !== normalizedAI);
+  const isConflict = !!(cleanRegex && cleanAI && normalizedRegex !== normalizedAI);
+  
+  // 优先使用 Regex 结果，其次 AI，最后显示"未识别"
+  const finalValue = cleanRegex || cleanAI || '未识别';
   
   return {
-    value: regexValue || aiValue || '未识别',
+    value: finalValue,
     isConflict,
     candidates
   };
@@ -679,6 +968,16 @@ function synthesizeResults(
   htmlSlices: HtmlSlices
 ): KeyInformation {
   const aiInfo = aiResult?.basicInfo || {};
+  
+  // 调试日志：对比 Regex 和 AI 的关键字段识别结果
+  console.log('========== 基本信息识别对比 ==========');
+  console.log('[对比] 预算金额:');
+  console.log(`   Regex: "${regexInfo.budget || '未识别'}"`);
+  console.log(`   AI:    "${aiInfo.budget || '未识别'}"`);
+  console.log('[对比] 保证金:');
+  console.log(`   Regex: "${regexInfo.bond || '未识别'}"`);
+  console.log(`   AI:    "${aiInfo.bond || '未识别'}"`);
+  console.log('=======================================');
   
   const basicInfo: BasicInfo = {
     projectName: createConflictField(regexInfo.projectName, aiInfo.projectName, 'Regex(全文扫描)', 'AI(智能识别)'),
